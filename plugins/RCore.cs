@@ -14,7 +14,7 @@ using ConVar;
 
 namespace Oxide.Plugins
 {
-    [Info("RCore", "rustcore.co", "1.1.5")]
+    [Info("RCore", "rustcore.co", "1.2.0")]
     [Description("Live telemetry and moderation ingest for rustcore.co")]
     public class RCore : RustPlugin
     {
@@ -62,6 +62,10 @@ namespace Oxide.Plugins
                 ["Mute.Blocked"] = "<color=#ff5555><b>You are currently muted.</b></color>\nReason: {0}\nTime remaining: <color=#ffaa55>{1}</color>",
                 ["Mute.VoiceBlocked"] = "<color=#ff5555><b>You are voice muted.</b></color>\nTime remaining: <color=#ffaa55>{0}</color>",
                 ["Mute.Removed"] = "<color=#55ff55><b>You have been unmuted.</b></color>",
+                ["Mute.Announced"] = "<color=#ffaa55>{0}</color> received a mute {1}. Reason: {2}",
+                ["Ban.Announced"] = "<color=#ff5555>{0}</color> received a ban {1}. Reason: {2}",
+                ["Unmute.Announced"] = "<color=#55ff55>{0}</color> is no longer muted.",
+                ["Unban.Announced"] = "<color=#55ff55>{0}</color> is no longer banned.",
                 ["Kick.Default"] = "Kicked by an administrator",
                 ["Autokick.Default"] = "You are not allowed on this server."
             }, this);
@@ -77,7 +81,7 @@ namespace Oxide.Plugins
 
         #region State
 
-        private const string VersionString = "1.1.5";
+        private const string VersionString = "1.2.0";
         private const int ProtocolVersion = 2;
 
         private const string BaseUrl = "https://api.rustcore.co";
@@ -1198,6 +1202,10 @@ namespace Oxide.Plugins
             _engine?.RequestFullSync(2f);
 
             if (IsLinked && IsRealSteamId(player.userID)) CheckAutokick(player);
+
+            string muteReason, muteTime;
+            if (IsMuted(player, out muteReason, out muteTime))
+                player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
         }
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
@@ -1209,6 +1217,29 @@ namespace Oxide.Plugins
             _woundedHits.Remove(player.UserIDString);
             _engine?.RecordDisconnect(player.UserIDString, reason);
             _engine?.RequestFullSync(1f);
+        }
+
+        private object OnClientCommand(Network.Connection connection, string text)
+        {
+            if (connection == null || !IsRealSteamId(connection.userid)) return null;
+
+            string body;
+            if (!TryGetChatBody(text, out body)) return null;
+            if (body.StartsWith("/", StringComparison.Ordinal)) return null;
+
+            string reason, timeLeft;
+            if (!IsMuted(connection.userid.ToString(CultureInfo.InvariantCulture), out reason, out timeLeft))
+                return null;
+
+            var player = connection.player as BasePlayer;
+            if (player != null)
+            {
+                string notice = Message("Mute.Blocked", player, reason, timeLeft);
+                SendToast(player, notice);
+                player.ChatMessage(notice);
+            }
+
+            return false;
         }
 
         private object OnPlayerChat(BasePlayer player, string message, ConVar.Chat.ChatChannel channel)
@@ -1418,6 +1449,15 @@ namespace Oxide.Plugins
                 if (online != null && online.IsConnected) online.Kick("Banned: " + reason);
             }
 
+            if (task.Announce)
+            {
+                AnnouncePublic(
+                    "Ban.Announced",
+                    DisplayName(task.PlayerName, task.SteamId),
+                    FormatAnnounceDuration(task.ExpiresAt),
+                    reason);
+            }
+
             return TaskResult.Ok();
         }
 
@@ -1430,6 +1470,10 @@ namespace Oxide.Plugins
             Puts($"unbanning {task.SteamId}");
             ConsoleSystem.Run(ConsoleSystem.Option.Server, "unban", task.SteamId);
             _engine?.Queue?.ScheduleWriteCfg();
+
+            if (task.Announce)
+                AnnouncePublic("Unban.Announced", DisplayName(task.PlayerName, task.SteamId));
+
             return TaskResult.Ok();
         }
 
@@ -1445,6 +1489,16 @@ namespace Oxide.Plugins
 
             string reason = string.IsNullOrEmpty(task.Reason) ? "Rule Violation" : task.Reason;
             ApplyMute(task.SteamId, reason, task.ExpiresAt, task.PlayerName);
+
+            if (task.Announce)
+            {
+                AnnouncePublic(
+                    "Mute.Announced",
+                    DisplayName(task.PlayerName, task.SteamId),
+                    FormatAnnounceDuration(task.ExpiresAt),
+                    reason);
+            }
+
             return TaskResult.Ok();
         }
 
@@ -1456,6 +1510,10 @@ namespace Oxide.Plugins
 
             Puts($"unmuting {task.SteamId}");
             ClearMute(task.SteamId, false);
+
+            if (task.Announce)
+                AnnouncePublic("Unmute.Announced", DisplayName(task.PlayerName, task.SteamId));
+
             return TaskResult.Ok();
         }
 
@@ -1948,13 +2006,8 @@ namespace Oxide.Plugins
 
         public bool RCore_IsMuted(string steamId)
         {
-            if (string.IsNullOrEmpty(steamId) || _mutes?.ActiveMutes == null) return false;
-
-            MuteInfo mute;
-            if (!_mutes.ActiveMutes.TryGetValue(steamId, out mute)) return false;
-
-            var expires = ParseExpiry(mute.ExpiresAt);
-            return expires == null || DateTimeOffset.UtcNow <= expires.Value;
+            string reason, timeLeft;
+            return IsMuted(steamId, out reason, out timeLeft);
         }
 
         public string RCore_GetMuteReason(string steamId)
@@ -2316,6 +2369,8 @@ namespace Oxide.Plugins
         private class TargetTaskDto
         {
             [JsonProperty("steamId")] public string SteamId { get; set; }
+            [JsonProperty("playerName")] public string PlayerName { get; set; }
+            [JsonProperty("announce")] public bool Announce { get; set; }
         }
 
         private class BanTaskDto
@@ -2326,6 +2381,7 @@ namespace Oxide.Plugins
             [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
             [JsonProperty("banIp")] public bool BanIp { get; set; }
             [JsonProperty("ip")] public string Ip { get; set; }
+            [JsonProperty("announce")] public bool Announce { get; set; }
         }
 
         private class MuteTaskDto
@@ -2334,6 +2390,7 @@ namespace Oxide.Plugins
             [JsonProperty("playerName")] public string PlayerName { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
             [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
+            [JsonProperty("announce")] public bool Announce { get; set; }
         }
 
         private class KickTaskDto
@@ -2647,20 +2704,67 @@ namespace Oxide.Plugins
             foreach (var key in stale) _woundedHits.Remove(key);
         }
 
+        private static readonly string[] ChatSayCommands = { "chat.teamsay", "chat.localsay", "chat.say" };
+
+        private static bool TryGetChatBody(string text, out string body)
+        {
+            body = "";
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            string matched = null;
+            for (int i = 0; i < ChatSayCommands.Length; i++)
+            {
+                string cmd = ChatSayCommands[i];
+                if (!text.StartsWith(cmd, StringComparison.OrdinalIgnoreCase)) continue;
+                if (text.Length != cmd.Length && !char.IsWhiteSpace(text[cmd.Length])) continue;
+                matched = cmd;
+                break;
+            }
+
+            if (matched == null) return false;
+
+            string rest = text.Substring(matched.Length).Trim();
+            if (rest.Length >= 2 && rest[0] == '"' && rest[rest.Length - 1] == '"')
+                rest = rest.Substring(1, rest.Length - 2).Trim();
+
+            int space = rest.IndexOf(' ');
+            if (space > 0)
+            {
+                int channel;
+                if (int.TryParse(rest.Substring(0, space), out channel) && channel >= 0 && channel <= 2)
+                    rest = rest.Substring(space + 1).Trim().Trim('"').Trim();
+            }
+
+            body = rest;
+            return true;
+        }
+
         private bool IsMuted(BasePlayer player, out string reason, out string timeRemaining)
+        {
+            if (player == null)
+            {
+                reason = null;
+                timeRemaining = null;
+                return false;
+            }
+
+            return IsMuted(player.UserIDString, out reason, out timeRemaining);
+        }
+
+        private bool IsMuted(string steamId, out string reason, out string timeRemaining)
         {
             reason = null;
             timeRemaining = null;
 
-            if (player == null || _mutes?.ActiveMutes == null) return false;
+            if (string.IsNullOrEmpty(steamId) || _mutes?.ActiveMutes == null) return false;
 
             MuteInfo mute;
-            if (!_mutes.ActiveMutes.TryGetValue(player.UserIDString, out mute)) return false;
+            if (!_mutes.ActiveMutes.TryGetValue(steamId, out mute)) return false;
 
             var expires = ParseExpiry(mute.ExpiresAt);
             if (expires != null && DateTimeOffset.UtcNow > expires.Value)
             {
-                ClearMute(player.UserIDString, true);
+                ClearMute(steamId, true);
                 return false;
             }
 
@@ -2676,8 +2780,6 @@ namespace Oxide.Plugins
             _mutes.ActiveMutes[steamId] = new MuteInfo { Reason = reason, ExpiresAt = expiresAt };
             SaveMutes();
 
-            ConsoleSystem.Run(ConsoleSystem.Option.Server, "unmute", steamId);
-
             string timeLeft = FormatTimeRemaining(ParseExpiry(expiresAt));
 
             ulong uid;
@@ -2686,6 +2788,7 @@ namespace Oxide.Plugins
                 var player = BasePlayer.FindByID(uid);
                 if (player != null && player.IsConnected)
                 {
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
                     string notice = Message("Mute.Applied", player, reason, timeLeft);
                     SendToast(player, notice);
                     player.ChatMessage(notice);
@@ -2698,14 +2801,14 @@ namespace Oxide.Plugins
             bool removed = _mutes.ActiveMutes.Remove(steamId);
             if (removed) SaveMutes();
 
-            ConsoleSystem.Run(ConsoleSystem.Option.Server, "unmute", steamId);
-            if (silent || !removed) return;
-
             ulong uid;
             if (!ulong.TryParse(steamId, out uid)) return;
 
             var player = BasePlayer.FindByID(uid);
             if (player == null || !player.IsConnected) return;
+
+            player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, false);
+            if (silent || !removed) return;
 
             string notice = Message("Mute.Removed", player);
             SendToast(player, notice);
@@ -2757,6 +2860,23 @@ namespace Oxide.Plugins
             if (remaining.TotalDays >= 1) return $"{(int)remaining.TotalDays}d {remaining.Hours}h";
             if (remaining.TotalHours >= 1) return $"{(int)remaining.TotalHours}h {remaining.Minutes}m";
             return $"{remaining.Minutes}m {remaining.Seconds}s";
+        }
+
+        private string FormatAnnounceDuration(string expiresAt)
+        {
+            var expiry = ParseExpiry(expiresAt);
+            if (expiry == null) return "permanently";
+            return "for " + FormatTimeRemaining(expiry);
+        }
+
+        private static string DisplayName(string playerName, string steamId)
+        {
+            return string.IsNullOrEmpty(playerName) ? steamId : playerName;
+        }
+
+        private void AnnouncePublic(string key, params object[] args)
+        {
+            PrintToChat(Message(key, null, args));
         }
 
         private void SendToast(BasePlayer player, string message)
