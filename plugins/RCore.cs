@@ -1,33 +1,33 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
-using System.Linq;
+using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Oxide.Core;
 using Oxide.Core.Libraries;
 using UnityEngine;
+using UnityEngine.Networking;
 using ConVar;
+
+// Core build by boxq
 
 namespace Oxide.Plugins
 {
-    [Info("RCore", "rustcore.co", "1.3.0")]
-    [Description("Live telemetry and moderation ingest for rustcore.co")]
+    [Info("RCore", "rustcore.co", "1.4.0")]
+    [Description("Connects a Rust server to RustCore.co")]
     public class RCore : RustPlugin
     {
         #region Configuration
 
-        private const ulong DefaultPanelAvatarSteamId = 76561198708173741UL;
-        private const string DefaultApiBaseUrl = "https://api.rustcore.co";
+        private const ulong DefaultAvatarSteamId = 76561198708173741UL;
+        private const string ApiBaseUrl = "https://api.rustcore.co";
 
         private class Configuration
         {
-            [JsonProperty("PanelAvatarSteamId")]
-            public ulong PanelAvatarSteamId = DefaultPanelAvatarSteamId;
-
-            [JsonProperty("ApiBaseUrl")]
-            public string ApiBaseUrl = DefaultApiBaseUrl;
+            [JsonProperty("AvatarSteamId")]
+            public ulong AvatarSteamId = DefaultAvatarSteamId;
         }
 
         protected override void LoadDefaultConfig() => _config = new Configuration();
@@ -39,31 +39,18 @@ namespace Oxide.Plugins
             try { _config = Config.ReadObject<Configuration>(); }
             catch (Exception ex)
             {
-                PrintWarning($"config unreadable ({ex.Message}), falling back to defaults");
+                PrintWarning($"config load failed: {ex.Message}");
                 _config = null;
             }
 
             if (_config == null) _config = new Configuration();
-            if (_config.PanelAvatarSteamId < SteamIdBase)
-                _config.PanelAvatarSteamId = DefaultPanelAvatarSteamId;
+            if (_config.AvatarSteamId < SteamIdBase)
+                _config.AvatarSteamId = DefaultAvatarSteamId;
 
-            _config.ApiBaseUrl = NormalizeApiBaseUrl(_config.ApiBaseUrl);
             SaveConfig();
         }
 
         protected override void SaveConfig() => Config.WriteObject(_config, true);
-
-        private string ApiBaseUrl => NormalizeApiBaseUrl(_config?.ApiBaseUrl);
-
-        private static string NormalizeApiBaseUrl(string value)
-        {
-            var url = (value ?? "").Trim().TrimEnd('/');
-            if (string.IsNullOrEmpty(url)) return DefaultApiBaseUrl;
-            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                return DefaultApiBaseUrl;
-            return url;
-        }
 
         #endregion
 
@@ -82,7 +69,8 @@ namespace Oxide.Plugins
                 ["Unmute.Announced"] = "<color=#55ff55>{0}</color> is no longer muted.",
                 ["Unban.Announced"] = "<color=#55ff55>{0}</color> is no longer banned.",
                 ["Kick.Default"] = "Kicked by an administrator",
-                ["Autokick.Default"] = "You are not allowed on this server."
+                ["Autokick.Default"] = "You are not allowed on this server.",
+                ["Autokick.Unavailable"] = "Unable to verify access right now. Please try again shortly."
             }, this);
         }
 
@@ -91,13 +79,20 @@ namespace Oxide.Plugins
             string template = lang.GetMessage(key, this, player?.UserIDString);
             return args.Length == 0 ? template : string.Format(template, args);
         }
-
+        
         #endregion
 
         #region State
 
-        private const string VersionString = "1.3.5";
         private const int ProtocolVersion = 2;
+        private const int MaxHttpConcurrent = 12;
+        private const int MaxAuthHttpConcurrent = 6;
+        private const int MaxAuthQueueDepth = 64;
+        private const int MaxControlQueueDepth = 128;
+        private const int MaxBulkQueueDepth = 256;
+        private const int MaxPolicyPending = 512;
+        private const int MaxPolicyBatch = 100;
+        private const int MaxPolicyAttempts = 3;
 
         private const string PairPath = "/api/setup/pair";
         private const string VerifyPath = "/api/ingest/verify";
@@ -113,7 +108,7 @@ namespace Oxide.Plugins
         private const string IdentityFileName = "RCore/identity";
         private const string MuteFileName = "RCore/mutes";
         private const string SpoolFileName = "RCore/spool";
-        private const string LegacyTaskFileName = "RCore/tasks";
+        private const string TaskFileName = "RCore/tasks";
 
         private const ulong SteamIdBase = 76561197960265728UL;
         private const float RequestTimeoutSeconds = 10f;
@@ -129,22 +124,24 @@ namespace Oxide.Plugins
         private const int MaxTeamChangesPerHeartbeat = 200;
         private const int MaxSendRetries = 5;
         private const int UnlinkThreshold = 5;
-        private const int LogEveryNFailures = 5;
         private const int MaxTasksPerAck = 200;
         private const long TaskRetentionSeconds = 86400;
         private const float SpoolWriteInterval = 60f;
         private const float LinkVerifyInterval = 30f;
         private const float MuteSweepInterval = 30f;
         private const float LoginSyncDebounce = 5f;
+        private const float FullSyncDebounce = 5f;
+        private const float TaskSaveInterval = 5f;
+        private const int MaxProcessedTasks = 20000;
+        private const float PolicyFlushInterval = 1.5f;
         private const float AutokickCacheTtl = 45f;
+        private const int MaxAutokickCacheEntries = 1024;
         private const float VoiceToastCooldown = 3f;
         private const float WoundRecordTtlSeconds = 900f;
         private const float DropWarnInterval = 300f;
 
         private const string CodeServerDeleted = "SERVER_DELETED";
         private const string CodeKeyRevoked = "KEY_REVOKED";
-        private const string CodeInvalidApiKey = "INVALID_API_KEY";
-
 #if CARBON
         private const string Framework = "carbon";
 #else
@@ -159,14 +156,23 @@ namespace Oxide.Plugins
         private ProcessedTaskStore _tasks;
         private RCoreEngine _engine;
 
+        private int _keyGeneration;
+
         private bool _commandsRegistered;
         private bool _pendingWipe;
+        private bool _tasksDirty;
         private float _lastLoginSync = -999f;
+        private float _lastFullSyncRequest = -999f;
 
         private readonly Dictionary<string, HitRecord> _woundedHits = new Dictionary<string, HitRecord>();
         private readonly Dictionary<ulong, float> _voiceToastCooldowns = new Dictionary<ulong, float>();
         private readonly Dictionary<ulong, AfkTracker> _afkTrackers = new Dictionary<ulong, AfkTracker>();
         private readonly Dictionary<string, AutokickCacheEntry> _autokickCache = new Dictionary<string, AutokickCacheEntry>();
+        private readonly Dictionary<string, PolicyPending> _policyPending = new Dictionary<string, PolicyPending>();
+        // Connection can be between JoinedGame and Spawn, no list yet. Finish kick in OnPlayerConnected.
+        private readonly Dictionary<ulong, string> _pendingKick = new Dictionary<ulong, string>();
+        private bool _policyInFlight;
+        private int _policyFailures;
 
         private bool IsLinked => _identity != null && !string.IsNullOrEmpty(_identity.ApiKey);
 
@@ -181,8 +187,42 @@ namespace Oxide.Plugins
             LoadIdentity();
             LoadMutes();
             LoadProcessedTasks();
-            DropLegacyTaskFile();
+            EnsureStores();
             RegisterCommands();
+        }
+
+        private void EnsureStores()
+        {
+            if (_mutes == null) _mutes = new MuteStore();
+            if (_mutes.ActiveMutes == null) _mutes.ActiveMutes = new Dictionary<string, MuteInfo>();
+            if (_tasks == null) _tasks = new ProcessedTaskStore();
+            if (_tasks.Processed == null) _tasks.Processed = new Dictionary<string, ProcessedTask>();
+            if (_tasks.PendingAck == null) _tasks.PendingAck = new Dictionary<string, TaskResult>();
+        }
+
+        private T TryLoad<T>(string file, string label) where T : class, new()
+        {
+            try { return Interface.Oxide.DataFileSystem.ReadObject<T>(file) ?? new T(); }
+            catch (Exception ex)
+            {
+                PrintWarning($"{label} load failed: {ex.Message}");
+                return new T();
+            }
+        }
+
+        private bool TrySave(string file, object data, string label)
+        {
+            if (data == null) return false;
+            try
+            {
+                Interface.Oxide.DataFileSystem.WriteObject(file, data);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"{label} save failed: {ex.Message}");
+                return false;
+            }
         }
 
         private void OnServerInitialized()
@@ -194,72 +234,155 @@ namespace Oxide.Plugins
             UnityEngine.Object.DontDestroyOnLoad(host);
             _engine = host.AddComponent<RCoreEngine>();
 
-            Puts($"RCore v{VersionString} {Framework}");
-            if (!IsLinked) Puts("Server is not linked. Run: rcore.pair <CODE>");
+            Puts($"RCore v{Version} loaded.");
+            if (!IsLinked)
+                Puts("This server is not connected to RustCore. Get a code at rustcore.co and run: rcore.pair <CODE>");
         }
 
         private void Unload()
         {
             if (_engine != null)
             {
+                // Destroy() waits a frame unload needs workers gone now
                 UnityEngine.Object.DestroyImmediate(_engine.gameObject);
                 _engine = null;
             }
 
+            SaveProcessedTasks();
             _woundedHits.Clear();
             _voiceToastCooldowns.Clear();
             _afkTrackers.Clear();
+            _autokickCache.Clear();
+            _policyPending.Clear();
+            _pendingKick.Clear();
+            _policyInFlight = false;
+            _policyFailures = 0;
             Instance = null;
         }
 
         private void RegisterCommands()
         {
             if (_commandsRegistered) return;
+            // some consoles only see global.rcore.*
             cmd.AddConsoleCommand("rcore.pair", this, nameof(CmdPair));
             cmd.AddConsoleCommand("global.rcore.pair", this, nameof(CmdPair));
-            cmd.AddConsoleCommand("rcore.unlink", this, nameof(CmdUnlink));
-            cmd.AddConsoleCommand("global.rcore.unlink", this, nameof(CmdUnlink));
-            cmd.AddConsoleCommand("rcore.status", this, nameof(CmdStatus));
-            cmd.AddConsoleCommand("rcore.poll", this, nameof(CmdPoll));
+            cmd.AddConsoleCommand("rcore.unpair", this, nameof(CmdUnpair));
+            cmd.AddConsoleCommand("global.rcore.unpair", this, nameof(CmdUnpair));
             _commandsRegistered = true;
         }
 
         private void LoadIdentity()
         {
-            try { _identity = Interface.Oxide.DataFileSystem.ReadObject<IdentityData>(IdentityFileName) ?? new IdentityData(); }
-            catch { _identity = new IdentityData(); }
+            _identity = TryLoad<IdentityData>(IdentityFileName, "identity");
             if (string.IsNullOrEmpty(_identity.InstalledAtUtc)) _identity.InstalledAtUtc = UtcNow();
+            if (!string.IsNullOrEmpty(_identity.ApiKey)) _keyGeneration = 1;
+            _pendingWipe = _identity.PendingWipe;
         }
 
-        private void SaveIdentity() => Interface.Oxide.DataFileSystem.WriteObject(IdentityFileName, _identity);
+        private void SaveIdentity()
+        {
+            if (_identity == null) return;
+            TrySave(IdentityFileName, _identity, "identity");
+        }
+
+        private void SetPendingWipe(bool pending)
+        {
+            _pendingWipe = pending;
+            if (_identity == null) return;
+            if (_identity.PendingWipe == pending) return;
+            _identity.PendingWipe = pending;
+            SaveIdentity();
+        }
 
         private void LoadMutes()
         {
-            try { _mutes = Interface.Oxide.DataFileSystem.ReadObject<MuteStore>(MuteFileName) ?? new MuteStore(); }
-            catch { _mutes = new MuteStore(); }
+            _mutes = TryLoad<MuteStore>(MuteFileName, "mutes");
             if (_mutes.ActiveMutes == null) _mutes.ActiveMutes = new Dictionary<string, MuteInfo>();
         }
 
-        private void SaveMutes() => Interface.Oxide.DataFileSystem.WriteObject(MuteFileName, _mutes);
+        private void SaveMutes()
+        {
+            if (_mutes?.ActiveMutes == null) return;
+            TrySave(MuteFileName, _mutes, "mutes");
+        }
+
+        private void ReconcileMutes(List<MuteSyncDto> snapshot)
+        {
+            if (snapshot == null || _mutes?.ActiveMutes == null) return;
+
+            var desired = new Dictionary<string, MuteInfo>(StringComparer.Ordinal);
+            for (int i = 0; i < snapshot.Count; i++)
+            {
+                var row = snapshot[i];
+                if (row == null || string.IsNullOrEmpty(row.SteamId)) continue;
+                if (!IsRealSteamId(row.SteamId)) continue;
+
+                var expiry = ParseExpiry(row.ExpiresAt);
+                if (expiry != null && DateTimeOffset.UtcNow > expiry.Value) continue;
+
+                desired[row.SteamId] = new MuteInfo
+                {
+                    Reason = string.IsNullOrEmpty(row.Reason) ? "Violation" : row.Reason,
+                    ExpiresAt = row.ExpiresAt,
+                    ExpiresAtParsed = expiry
+                };
+            }
+
+            var toClear = new List<string>();
+            foreach (var key in _mutes.ActiveMutes.Keys)
+            {
+                if (!desired.ContainsKey(key)) toClear.Add(key);
+            }
+            for (int i = 0; i < toClear.Count; i++)
+                ClearMute(toClear[i], true);
+
+            foreach (var pair in desired)
+            {
+                MuteInfo existing;
+                if (_mutes.ActiveMutes.TryGetValue(pair.Key, out existing)
+                    && existing != null
+                    && string.Equals(existing.Reason, pair.Value.Reason, StringComparison.Ordinal)
+                    && string.Equals(existing.ExpiresAt ?? "", pair.Value.ExpiresAt ?? "", StringComparison.Ordinal))
+                {
+                    EnforceChatMuteFlag(pair.Key, true);
+                    continue;
+                }
+
+                ApplyMute(pair.Key, pair.Value.Reason, pair.Value.ExpiresAt, null, notify: false);
+            }
+        }
+
+        // FindByID sometimes misses connected players
+        private static BasePlayer FindConnectedPlayer(string steamId)
+        {
+            if (!ulong.TryParse(steamId, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong uid))
+                return null;
+
+            var player = BasePlayer.FindByID(uid);
+            if (player != null && player.IsConnected) return player;
+
+            for (int i = 0; i < BasePlayer.activePlayerList.Count; i++)
+            {
+                var p = BasePlayer.activePlayerList[i];
+                if (p != null && p.userID == uid && p.IsConnected) return p;
+            }
+            return null;
+        }
+
+        // don't call mute/unmute cmds - BetterChat shadows them
+        private static void EnforceChatMuteFlag(string steamId, bool muted)
+        {
+            var player = FindConnectedPlayer(steamId);
+            if (player == null) return;
+            player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, muted);
+        }
 
         private void LoadProcessedTasks()
         {
-            _tasks = new ProcessedTaskStore();
-        }
-
-        private void DropLegacyTaskFile()
-        {
-            try
-            {
-                if (!Interface.Oxide.DataFileSystem.ExistsDatafile(LegacyTaskFileName)) return;
-                var path = Interface.Oxide.DataFileSystem.GetFile(LegacyTaskFileName).Filename;
-                if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
-                    System.IO.File.Delete(path);
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"could not remove leftover task store: {ex.Message}");
-            }
+            _tasks = TryLoad<ProcessedTaskStore>(TaskFileName, "tasks");
+            if (_tasks.Processed == null) _tasks.Processed = new Dictionary<string, ProcessedTask>();
+            if (_tasks.PendingAck == null) _tasks.PendingAck = new Dictionary<string, TaskResult>();
+            PruneProcessedTasks();
         }
 
         private const uint MinAuthLevelForCommands = 2;
@@ -278,7 +401,6 @@ namespace Oxide.Plugins
             if (arg == null) return false;
             if (IsOperator(arg)) return true;
             arg.ReplyWith("You do not have permission to use this command.");
-            PrintWarning($"{arg.Connection.username} ({arg.Connection.userid}) tried to run {arg.cmd?.FullName ?? "an rcore command"} without owner auth");
             return false;
         }
 
@@ -295,7 +417,7 @@ namespace Oxide.Plugins
             var link = _engine?.Link;
             if (link == null)
             {
-                Reply(arg, "RCore engine is not running yet, retry once the server has finished starting");
+                Reply(arg, "RCore is still starting. Try again shortly.");
                 return;
             }
 
@@ -306,61 +428,29 @@ namespace Oxide.Plugins
                 return;
             }
 
-            Reply(arg, "pairing requested — see the server console for the result");
+            Reply(arg, "Pairing started. Check the server console.");
             link.Pair(code);
         }
 
-        private void CmdUnlink(ConsoleSystem.Arg arg)
+        private void CmdUnpair(ConsoleSystem.Arg arg)
         {
             if (!RequireOperator(arg)) return;
 
             if (!IsLinked)
             {
-                Reply(arg, "Server is not linked.");
+                Reply(arg, "This server is not connected to RustCore.");
                 return;
             }
 
             var link = _engine?.Link;
             if (link == null)
             {
-                Reply(arg, "RCore engine is not running yet, retry once the server has finished starting");
+                Reply(arg, "RCore is still starting. Try again shortly.");
                 return;
             }
 
-            var serverId = _identity.ServerId;
             link.UnlinkByOperator();
-            Reply(arg, $"unlinked from server {serverId}. Run rcore.pair <CODE> to link again.");
-        }
-
-        private void CmdStatus(ConsoleSystem.Arg arg)
-        {
-            if (!RequireOperator(arg)) return;
-
-            var lines = new List<string>
-            {
-                $"RCore v{VersionString} ({Framework}, protocol {ProtocolVersion})",
-                IsLinked
-                    ? $"linked: server={_identity.ServerId} project={_identity.ProjectId} since={_identity.PairedAtUtc}"
-                    : "linked: no — run rcore.pair <CODE>",
-                $"backend: {ApiBaseUrl}",
-                $"active mutes: {_mutes.ActiveMutes.Count}, tracked wounds: {_woundedHits.Count}",
-                _engine != null ? _engine.DescribeBuffers() : "engine: not running"
-            };
-            Reply(arg, string.Join("\n", lines));
-        }
-
-        private void CmdPoll(ConsoleSystem.Arg arg)
-        {
-            if (!RequireOperator(arg)) return;
-
-            var queue = _engine?.Queue;
-            if (queue == null)
-            {
-                Reply(arg, "not linked, nothing to poll");
-                return;
-            }
-            Reply(arg, "forcing queue poll");
-            queue.Poll();
+            Reply(arg, "This server is no longer connected to RustCore. Run rcore.pair <CODE> to connect it again.");
         }
 
         #endregion
@@ -372,13 +462,12 @@ namespace Oxide.Plugins
             public static RCoreEngine Current;
 
             public LinkWorker Link;
+            public HttpPump Http;
             public StateWorker State;
             public QueueWorker Queue;
             public ChatWorker Chat;
             public ReportWorker Reports;
             public CombatWorker Combat;
-            public MuteWorker Mutes;
-            public SpoolWorker Spooler;
 
             private GameObject _session;
             private SpoolStore _spool = new SpoolStore();
@@ -389,17 +478,40 @@ namespace Oxide.Plugins
                 Current = this;
                 LoadSpool();
 
+                Http = gameObject.AddComponent<HttpPump>();
                 Link = gameObject.AddComponent<LinkWorker>();
                 Link.OnLinked += OpenSession;
                 Link.OnUnlinked += CloseSession;
 
+                InvokeRepeating(nameof(TickMutes), UnityEngine.Random.Range(0f, 5f), MuteSweepInterval);
+                InvokeRepeating(nameof(TickSpool), UnityEngine.Random.Range(0f, 5f), SpoolWriteInterval);
+                InvokeRepeating(nameof(TickTaskSave), TaskSaveInterval, TaskSaveInterval);
+
                 if (Instance != null && Instance.IsLinked) OpenSession();
+            }
+
+            private void TickMutes()
+            {
+                Instance?.SweepExpiredMutes();
+            }
+
+            private void TickSpool()
+            {
+                RecoverSpool();
+                WriteSpool();
+            }
+
+            private void TickTaskSave()
+            {
+                Instance?.FlushProcessedTasksIfDirty();
             }
 
             private void OnDestroy()
             {
+                CancelInvoke();
                 CloseSession();
                 WriteSpool(true);
+                Instance?.FlushProcessedTasksIfDirty(force: true);
                 if (Current == this) Current = null;
             }
 
@@ -412,11 +524,10 @@ namespace Oxide.Plugins
 
                 State = _session.AddComponent<StateWorker>();
                 Queue = _session.AddComponent<QueueWorker>();
+                _session.AddComponent<PolicyWorker>();
                 Chat = _session.AddComponent<ChatWorker>();
                 Reports = _session.AddComponent<ReportWorker>();
                 Combat = _session.AddComponent<CombatWorker>();
-                Mutes = _session.AddComponent<MuteWorker>();
-                Spooler = _session.AddComponent<SpoolWorker>();
 
                 State.RequestSync(0.5f);
             }
@@ -425,18 +536,25 @@ namespace Oxide.Plugins
             {
                 if (_session == null) return;
 
-                var doomed = _session;
+                var session = _session;
                 _session = null;
                 State = null; Queue = null; Chat = null;
-                Reports = null; Combat = null; Mutes = null; Spooler = null;
+                Reports = null; Combat = null;
 
-                UnityEngine.Object.DestroyImmediate(doomed);
+                UnityEngine.Object.DestroyImmediate(session);
                 WriteSpool(true);
             }
 
             public void HandleTasks(List<QueueTaskDto> tasks) => Queue?.Dispatch(tasks);
 
-            public void RequestFullSync(float delay) => State?.RequestSync(delay);
+            public void RequestFullSync(float delay)
+            {
+                if (State == null || Instance == null) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (now - Instance._lastFullSyncRequest < FullSyncDebounce) return;
+                Instance._lastFullSyncRequest = now;
+                State.RequestSync(delay);
+            }
 
             public void RecordDisconnect(string steamId, string reason) => State?.EnqueueDisconnect(steamId, reason);
 
@@ -455,114 +573,166 @@ namespace Oxide.Plugins
                 };
 
                 if (State != null) State.EnqueueAlert(alert);
-                else Retain(SpoolKind.Alerts, new List<AlertDto> { alert });
+                else SpoolItems(SpoolKind.Alerts, alert);
             }
 
-            public void Retain<T>(SpoolKind kind, List<T> items)
+            public void SpoolItems<T>(SpoolKind kind, T item)
+            {
+                if (item == null) return;
+                var bucket = Bucket(kind);
+                var inFlight = InFlightBucket(kind);
+                var token = JToken.FromObject(item);
+                var eventId = SpoolEventId(token);
+                if (eventId != null && SpoolContainsEvent(inFlight, eventId)) return;
+                if (eventId != null && SpoolContainsEvent(bucket, eventId)) return;
+                bucket.Add(token);
+                if (bucket.Count > MaxBufferItems)
+                    bucket.RemoveRange(0, bucket.Count - MaxBufferItems);
+                _spoolDirty = true;
+            }
+
+            public void SpoolItems<T>(SpoolKind kind, List<T> items)
             {
                 if (items == null || items.Count == 0) return;
                 var bucket = Bucket(kind);
+                var inFlight = InFlightBucket(kind);
                 foreach (var item in items)
                 {
                     if (item == null) continue;
-                    if (bucket.Count >= MaxBufferItems) bucket.RemoveAt(0);
-                    bucket.Add(JToken.FromObject(item));
+                    var token = JToken.FromObject(item);
+                    var eventId = SpoolEventId(token);
+                    if (eventId != null && SpoolContainsEvent(inFlight, eventId))
+                        continue;
+                    if (eventId != null && SpoolContainsEvent(bucket, eventId))
+                        continue;
+                    bucket.Add(token);
                 }
+                if (bucket.Count > MaxBufferItems)
+                    bucket.RemoveRange(0, bucket.Count - MaxBufferItems);
                 _spoolDirty = true;
             }
 
-            private List<T> Recover<T>(SpoolKind kind, int max)
+            private List<T> Claim<T>(SpoolKind kind, int max)
             {
-                var bucket = Bucket(kind);
-                int count = Math.Min(bucket.Count, max);
-                var result = new List<T>();
+                var pending = Bucket(kind);
+                var inFlight = InFlightBucket(kind);
+
+                if (inFlight.Count > 0)
+                    return DeserializeSpool<T>(inFlight, inFlight.Count);
+
+                int count = Math.Min(pending.Count, max);
+                if (count <= 0) return new List<T>();
 
                 for (int i = 0; i < count; i++)
+                    inFlight.Add(pending[i]);
+                pending.RemoveRange(0, count);
+                _spoolDirty = true;
+                WriteSpool(true);
+
+                return DeserializeSpool<T>(inFlight, inFlight.Count);
+            }
+
+            public void CommitSpool(SpoolKind kind, int sentCount)
+            {
+                if (sentCount <= 0) return;
+                var inFlight = InFlightBucket(kind);
+                int n = Math.Min(sentCount, inFlight.Count);
+                if (n <= 0) return;
+                inFlight.RemoveRange(0, n);
+                _spoolDirty = true;
+                WriteSpool(true);
+            }
+
+            public void ReturnClaimed(SpoolKind kind)
+            {
+                var pending = Bucket(kind);
+                var inFlight = InFlightBucket(kind);
+                if (inFlight.Count == 0) return;
+                pending.InsertRange(0, inFlight);
+                inFlight.Clear();
+                if (pending.Count > MaxBufferItems)
+                    pending.RemoveRange(0, pending.Count - MaxBufferItems);
+                _spoolDirty = true;
+                WriteSpool(true);
+            }
+
+            private static List<T> DeserializeSpool<T>(List<JToken> source, int count)
+            {
+                var result = new List<T>(count);
+                for (int i = 0; i < count && i < source.Count; i++)
                 {
-                    try { result.Add(bucket[i].ToObject<T>()); }
+                    try { result.Add(source[i].ToObject<T>()); }
                     catch { }
                 }
-
-                if (count == 0) return result;
-                bucket.RemoveRange(0, count);
-                _spoolDirty = true;
                 return result;
+            }
+
+            private static string SpoolEventId(JToken token)
+            {
+                if (token == null || token.Type != JTokenType.Object) return null;
+                var id = token["eventId"];
+                return id != null && id.Type == JTokenType.String ? (string)id : null;
+            }
+
+            private static bool SpoolContainsEvent(List<JToken> bucket, string eventId)
+            {
+                if (string.IsNullOrEmpty(eventId) || bucket == null) return false;
+                for (int i = 0; i < bucket.Count; i++)
+                {
+                    if (string.Equals(SpoolEventId(bucket[i]), eventId, StringComparison.Ordinal))
+                        return true;
+                }
+                return false;
             }
 
             public void RecoverSpool()
             {
-                int total = 0;
-
                 if (Chat != null && Chat.WantsSpool)
-                {
-                    var items = Recover<ChatItemDto>(SpoolKind.Chat, Chat.SpoolChunk);
-                    Chat.EnqueueRange(items);
-                    total += items.Count;
-                }
+                    Chat.EnqueueRange(Claim<ChatItemDto>(SpoolKind.Chat, Chat.SpoolChunk));
 
                 if (Reports != null && Reports.WantsSpool)
-                {
-                    var items = Recover<ReportItemDto>(SpoolKind.Reports, Reports.SpoolChunk);
-                    Reports.EnqueueRange(items);
-                    total += items.Count;
-                }
+                    Reports.EnqueueRange(Claim<ReportItemDto>(SpoolKind.Reports, Reports.SpoolChunk));
 
                 if (Combat != null && Combat.WantsSpool)
+                    Combat.EnqueueRange(Claim<DeathEventDto>(SpoolKind.Deaths, Combat.SpoolChunk));
+
+                if (State == null || !State.Ready) return;
+
+                if (State.WantsAlertSpool)
                 {
-                    var items = Recover<DeathEventDto>(SpoolKind.Deaths, Combat.SpoolChunk);
-                    Combat.EnqueueRange(items);
-                    total += items.Count;
+                    foreach (var alert in Claim<AlertDto>(SpoolKind.Alerts, State.SpoolChunk))
+                        State.EnqueueAlert(alert);
                 }
 
-                if (State != null && State.WantsSpool)
-                {
-                    var items = Recover<AlertDto>(SpoolKind.Alerts, State.SpoolChunk);
-                    foreach (var alert in items) State.EnqueueAlert(alert);
-                    total += items.Count;
-                }
+                if (State.WantsDisconnectSpool)
+                    State.EnqueueDisconnectRange(Claim<DisconnectDto>(SpoolKind.Disconnects, MaxDisconnectsPerHeartbeat));
 
-                if (total == 0) return;
-
-                Log($"recovered {total} spooled event(s) from disk");
-                WriteSpool(true);
+                if (State.WantsTeamChangeSpool)
+                    State.EnqueueTeamChangeRange(Claim<TeamChangeDto>(SpoolKind.TeamChanges, MaxTeamChangesPerHeartbeat));
             }
 
             public void WriteSpool(bool force = false)
             {
                 if (!force && !_spoolDirty) return;
-                try
-                {
-                    Interface.Oxide.DataFileSystem.WriteObject(SpoolFileName, _spool);
+                if (Instance != null && Instance.TrySave(SpoolFileName, _spool, "spool"))
                     _spoolDirty = false;
-                }
-                catch (Exception ex) { Warn($"spool write failed: {ex.Message}"); }
-            }
-
-            public string DescribeBuffers()
-            {
-                if (_session == null) return "engine: running, session closed";
-                return $"buffers: chat={Chat?.Pending ?? 0} reports={Reports?.Pending ?? 0} " +
-                       $"deaths={Combat?.Pending ?? 0} alerts={State?.PendingAlerts ?? 0} " +
-                       $"spool={_spool.Chat.Count + _spool.Reports.Count + _spool.Deaths.Count + _spool.Alerts.Count}";
             }
 
             private void LoadSpool()
             {
-                try { _spool = Interface.Oxide.DataFileSystem.ReadObject<SpoolStore>(SpoolFileName) ?? new SpoolStore(); }
-                catch { _spool = new SpoolStore(); }
-                _spool.Normalize();
+                _spool = Instance != null
+                    ? Instance.TryLoad<SpoolStore>(SpoolFileName, "spool")
+                    : new SpoolStore();
+                if (_spool.ReclaimInFlight())
+                {
+                    _spoolDirty = true;
+                    WriteSpool(true);
+                }
+                else _spool.Normalize();
             }
 
-            private List<JToken> Bucket(SpoolKind kind)
-            {
-                switch (kind)
-                {
-                    case SpoolKind.Chat: return _spool.Chat;
-                    case SpoolKind.Reports: return _spool.Reports;
-                    case SpoolKind.Deaths: return _spool.Deaths;
-                    default: return _spool.Alerts;
-                }
-            }
+            private List<JToken> Bucket(SpoolKind kind) => _spool.Pending[(int)kind];
+            private List<JToken> InFlightBucket(SpoolKind kind) => _spool.InFlight[(int)kind];
         }
 
         private abstract class RCoreWorker : MonoBehaviour
@@ -571,7 +741,8 @@ namespace Oxide.Plugins
 
             private int _inFlight;
             private float _inFlightSince = -1f;
-            private string _inFlightPath;
+            private int _sendGeneration;
+            private Action _watchdogFail;
             private int _failures;
             private float _backoffUntil;
 
@@ -593,10 +764,13 @@ namespace Oxide.Plugins
                         float limit = RequestTimeoutSeconds * 3f;
                         if (_inFlightSince < 0f || now - _inFlightSince <= limit) return false;
 
+                        _sendGeneration++;
                         _inFlight = 0;
                         _inFlightSince = -1f;
-                        Warn($"{GetType().Name}: request to {_inFlightPath} never completed after {limit:0}s, releasing the worker");
-                        return true;
+                        var fail = _watchdogFail;
+                        _watchdogFail = null;
+                        fail?.Invoke();
+                        return now >= _backoffUntil;
                     }
 
                     return now >= _backoffUntil;
@@ -605,12 +779,15 @@ namespace Oxide.Plugins
 
             private void Awake()
             {
+                // desync ticks across servers
                 InvokeRepeating(nameof(Tick), UnityEngine.Random.Range(0f, 5f), Mathf.Max(1f, Interval));
             }
 
             private void OnDestroy()
             {
                 CancelInvoke();
+                _sendGeneration++;
+                _watchdogFail = null;
                 Drain();
             }
 
@@ -627,24 +804,37 @@ namespace Oxide.Plugins
                 if (payload != null)
                 {
                     try { body = JsonConvert.SerializeObject(payload, Formatting.None); }
-                    catch (Exception ex)
-                    {
-                        Warn($"{GetType().Name}: payload serialization failed: {ex.Message}");
-                        return;
-                    }
+                    catch { return; }
                 }
 
                 if (_inFlight == 0) _inFlightSince = UnityEngine.Time.realtimeSinceStartup;
                 _inFlight++;
-                _inFlightPath = path;
+
+                int keyGen = plugin._keyGeneration;
+                int sendGen = ++_sendGeneration;
+                _watchdogFail = () =>
+                {
+                    NoteFailure();
+                    onError?.Invoke(0, null);
+                };
 
                 plugin.Request(path, body, method, (code, response) =>
                 {
+                    if (this == null) return;
+                    if (sendGen != _sendGeneration) return;
+
                     _inFlight = Mathf.Max(0, _inFlight - 1);
                     if (_inFlight == 0) _inFlightSince = -1f;
-                    if (this == null) return;
+                    _watchdogFail = null;
 
-                    Engine?.Link?.NoteResponse(code, response);
+                    Engine?.Link?.NoteResponse(code, response, keyGen);
+
+                    if (keyGen != plugin._keyGeneration)
+                    {
+                        if (code >= 200 && code < 300) onSuccess?.Invoke(null);
+                        else onError?.Invoke(code, response);
+                        return;
+                    }
 
                     if (code >= 200 && code < 300)
                     {
@@ -655,26 +845,24 @@ namespace Oxide.Plugins
                         if (!string.IsNullOrEmpty(response))
                         {
                             try { parsed = JsonConvert.DeserializeObject<T>(response); }
-                            catch (Exception ex) { Warn($"{GetType().Name}: malformed response from {path}: {ex.Message}"); }
+                            catch { parsed = null; }
                         }
 
                         onSuccess?.Invoke(parsed);
                         return;
                     }
 
-                    NoteFailure(path, code, response);
+                    NoteFailure();
                     onError?.Invoke(code, response);
                 });
             }
 
-            private void NoteFailure(string path, int code, string response)
+            private void NoteFailure()
             {
                 _failures++;
                 float delay = BackoffSteps[Mathf.Min(_failures - 1, BackoffSteps.Length - 1)];
+                delay *= UnityEngine.Random.Range(0.75f, 1.25f);
                 _backoffUntil = UnityEngine.Time.realtimeSinceStartup + delay;
-
-                if (_failures == 1 || _failures % LogEveryNFailures == 0)
-                    Warn($"{GetType().Name}: {path} failed {_failures}x (code {code}), retrying in {delay:0}s — {DescribeAuthFailure(code, response)}");
             }
         }
 
@@ -690,8 +878,6 @@ namespace Oxide.Plugins
             protected virtual int BatchSize => MaxBatchItems;
             protected virtual object BuildPayload(List<TItem> items) => new BatchPayload<TItem> { Items = items };
 
-            public int Pending => Buffer.Count + (_inFlightBatch?.Count ?? 0);
-
             public bool WantsSpool => Ready && Buffer.Count < BatchSize;
 
             public int SpoolChunk => BatchSize;
@@ -700,7 +886,11 @@ namespace Oxide.Plugins
             {
                 get
                 {
-                    if (_buffer == null) _buffer = new EventBuffer<TItem>(GetType().Name);
+                    if (_buffer == null)
+                    {
+                        _buffer = new EventBuffer<TItem>(GetType().Name,
+                            item => Engine?.SpoolItems(Kind, item));
+                    }
                     return _buffer;
                 }
             }
@@ -725,8 +915,10 @@ namespace Oxide.Plugins
                 Send<JObject>(Path, BuildPayload(batch),
                     _ =>
                     {
+                        int sent = _inFlightBatch?.Count ?? 0;
                         _inFlightBatch = null;
                         _retries = 0;
+                        Engine?.CommitSpool(Kind, sent);
                     },
                     (code, response) =>
                     {
@@ -736,21 +928,21 @@ namespace Oxide.Plugins
                         if (++_retries < MaxSendRetries) return;
                         _retries = 0;
 
-                        var spilled = Buffer.Take(BatchSize);
-                        Engine?.Retain(Kind, spilled);
-                        Warn($"{GetType().Name}: spooled {spilled.Count} event(s) to disk after {MaxSendRetries} failed attempts");
+                        Engine?.ReturnClaimed(Kind);
+                        Engine?.SpoolItems(Kind, Buffer.Take(BatchSize));
                     });
             }
 
             protected override void Drain()
             {
+                Engine?.ReturnClaimed(Kind);
                 var pending = Buffer.DrainAll();
                 if (_inFlightBatch != null)
                 {
                     pending.InsertRange(0, _inFlightBatch);
                     _inFlightBatch = null;
                 }
-                Engine?.Retain(Kind, pending);
+                Engine?.SpoolItems(Kind, pending);
             }
         }
 
@@ -785,15 +977,11 @@ namespace Oxide.Plugins
             {
                 if (Instance == null) return;
 
-                if (string.IsNullOrEmpty(code))
-                {
-                    Log("Usage: rcore.pair <CODE>");
-                    return;
-                }
+                if (string.IsNullOrEmpty(code)) return;
 
                 if (_pairPending)
                 {
-                    Log("pairing already in progress");
+                    Announce("Pairing already in progress.");
                     return;
                 }
 
@@ -802,18 +990,14 @@ namespace Oxide.Plugins
                 var currentServerId = Instance.IsLinked && !string.IsNullOrEmpty(Instance._identity.ServerId)
                     ? Instance._identity.ServerId
                     : null;
-                if (currentServerId != null)
-                    Log($"already linked as server {currentServerId}: only a re-pair code for this server is accepted (run rcore.unlink first to link as a different server)");
-
-                Log("pairing with rustcore.co...");
 
                 var payload = new PairRequest
                 {
                     Code = code,
                     ServerName = ConVar.Server.hostname ?? "Rust Server",
                     Port = ConVar.Server.port,
-                    DisplayIp = SafeServerIp(),
-                    Version = VersionString,
+                    DisplayIp = (string.IsNullOrWhiteSpace(ConVar.Server.ip) || ConVar.Server.ip == "0.0.0.0" ? null : ConVar.Server.ip),
+                    Version = Instance.Version.ToString(),
                     ProtocolVersion = ProtocolVersion,
                     Framework = Framework,
                     CurrentServerId = currentServerId,
@@ -825,21 +1009,22 @@ namespace Oxide.Plugins
                 Instance.Request(PairPath, body, RequestMethod.POST, (status, response) =>
                 {
                     _pairPending = false;
+                    if (Instance == null) return;
 
                     if (status != 200 && status != 201)
                     {
-                        Warn($"pairing failed ({status}): {DescribeFailure(status, response)}");
+                        Announce($"Pairing failed: {DescribeFailure(status, response)}");
                         return;
                     }
 
                     PairResponse parsed = null;
                     try { parsed = JsonConvert.DeserializeObject<PairResponse>(response ?? ""); }
-                    catch (Exception ex) { Warn($"pairing failed, unreadable response: {ex.Message}"); }
+                    catch { parsed = null; }
 
                     var data = parsed?.Data;
                     if (data == null || string.IsNullOrEmpty(data.ApiKey))
                     {
-                        Warn("pairing failed: backend did not return an API key");
+                        Announce("Pairing failed. Please try again with a new code.");
                         return;
                     }
 
@@ -848,17 +1033,24 @@ namespace Oxide.Plugins
                     Instance._identity.ProjectId = data.ProjectId;
                     Instance._identity.PairedAtUtc = UtcNow();
                     Instance._identity.LastError = null;
+                    Instance._keyGeneration++;
+                    Instance.ClearAutokickState();
                     Instance.SaveIdentity();
 
                     _fatalStreak = 0;
-                    Log($"paired successfully (server {data.ServerId})");
+                    Announce("This server is now connected to RustCore.");
                     OnLinked?.Invoke();
                     Interface.CallHook("RCore_OnLinked", data.ServerId, data.ProjectId);
                 }, false);
             }
 
-            public void NoteResponse(int code, string body)
+            public void NoteResponse(int code, string body, int requestKeyGeneration = -1)
             {
+                if (Instance == null) return;
+
+                if (requestKeyGeneration >= 0 && requestKeyGeneration != Instance._keyGeneration) return;
+                if (_pairPending) return;
+
                 if (code >= 200 && code < 300)
                 {
                     _fatalStreak = 0;
@@ -869,13 +1061,9 @@ namespace Oxide.Plugins
                 if (!IsRevocation(body)) return;
 
                 _fatalStreak++;
-                if (_fatalStreak < UnlinkThreshold)
-                {
-                    Warn($"backend reported the link is gone ({code}), {UnlinkThreshold - _fatalStreak} more before unlinking");
-                    return;
-                }
+                if (_fatalStreak < UnlinkThreshold) return;
 
-                Unlink($"backend returned {code} with a revocation code {UnlinkThreshold} times in a row");
+                Unlink($"RustCore revoked the link ({code}).", true);
             }
 
             private static bool IsRevocation(string body)
@@ -888,32 +1076,35 @@ namespace Oxide.Plugins
 
             private static string DescribeFailure(int status, string body)
             {
-                if (status == 0) return "no response from the backend (network error or timeout)";
+                if (status == 0) return "no response from RustCore.";
 
                 string code, message;
                 if (TryReadErrorCode(body, out code, out message))
-                    return string.IsNullOrEmpty(message) ? code : $"{code} — {message}";
+                    return string.IsNullOrEmpty(message) ? code : message;
 
-                return SummarizeHttpFailure(status, body);
+                return $"HTTP {status}.";
             }
 
             public void UnlinkByOperator()
             {
                 if (Instance == null || !Instance.IsLinked) return;
-                Unlink($"operator ran rcore.unlink (was server {Instance._identity.ServerId}, project {Instance._identity.ProjectId})");
+                Unlink("Operator ran rcore.unpair.", false);
             }
 
-            private void Unlink(string reason)
+            private void Unlink(string reason, bool announce)
             {
                 if (Instance == null) return;
 
-                Warn($"unlinking: {reason}. Use 'rcore.pair <CODE>' to link again.");
+                if (announce)
+                    Announce("This server is no longer connected to RustCore. Run rcore.pair <CODE> to connect it again.");
 
                 Instance._identity.ApiKey = null;
                 Instance._identity.ServerId = null;
                 Instance._identity.ProjectId = null;
                 Instance._identity.PairedAtUtc = null;
                 Instance._identity.LastError = reason;
+                Instance._keyGeneration++;
+                Instance.ClearAutokickState();
                 Instance.SaveIdentity();
 
                 _fatalStreak = 0;
@@ -924,9 +1115,9 @@ namespace Oxide.Plugins
 
         private class StateWorker : RCoreWorker
         {
-            private readonly EventBuffer<AlertDto> _alerts = new EventBuffer<AlertDto>("alerts");
-            private readonly EventBuffer<DisconnectDto> _disconnects = new EventBuffer<DisconnectDto>("disconnects");
-            private readonly EventBuffer<TeamChangeDto> _teamChanges = new EventBuffer<TeamChangeDto>("teamChanges");
+            private EventBuffer<AlertDto> _alerts;
+            private EventBuffer<DisconnectDto> _disconnects;
+            private EventBuffer<TeamChangeDto> _teamChanges;
             private List<AlertDto> _alertsInFlight;
             private List<DisconnectDto> _disconnectsInFlight;
             private List<TeamChangeDto> _teamChangesInFlight;
@@ -935,32 +1126,67 @@ namespace Oxide.Plugins
 
             protected override float Interval => IdleHeartbeatSeconds;
 
-            public int PendingAlerts => _alerts.Count + (_alertsInFlight?.Count ?? 0);
+            private EventBuffer<AlertDto> Alerts =>
+                _alerts ?? (_alerts = new EventBuffer<AlertDto>("alerts",
+                    item => Engine?.SpoolItems(SpoolKind.Alerts, item)));
 
-            public bool WantsSpool => Ready && _alerts.Count < MaxBatchItems;
+            private EventBuffer<DisconnectDto> Disconnects =>
+                _disconnects ?? (_disconnects = new EventBuffer<DisconnectDto>("disconnects",
+                    item => Engine?.SpoolItems(SpoolKind.Disconnects, item)));
+
+            private EventBuffer<TeamChangeDto> TeamChanges =>
+                _teamChanges ?? (_teamChanges = new EventBuffer<TeamChangeDto>("teamChanges",
+                    item => Engine?.SpoolItems(SpoolKind.TeamChanges, item)));
+
+            public bool WantsAlertSpool => Ready && Alerts.Count < MaxBatchItems;
+            public bool WantsDisconnectSpool => Ready && Disconnects.Count < MaxDisconnectsPerHeartbeat;
+            public bool WantsTeamChangeSpool => Ready && TeamChanges.Count < MaxTeamChangesPerHeartbeat;
 
             public int SpoolChunk => MaxBatchItems;
 
-            public void EnqueueAlert(AlertDto alert) => _alerts.Add(alert);
+            public void EnqueueAlert(AlertDto alert) => Alerts.Add(alert);
 
             public void EnqueueDisconnect(string steamId, string reason)
             {
                 if (string.IsNullOrEmpty(steamId)) return;
                 string trimmed = string.IsNullOrWhiteSpace(reason) ? "Disconnected" : reason.Trim();
                 if (trimmed.Length > 256) trimmed = trimmed.Substring(0, 256);
-                _disconnects.Add(new DisconnectDto { SteamId = steamId, Reason = trimmed });
+                Disconnects.Add(new DisconnectDto { EventId = NewEventId(), SteamId = steamId, Reason = trimmed });
+            }
+
+            public void EnqueueDisconnectRange(List<DisconnectDto> items)
+            {
+                if (items == null || items.Count == 0) return;
+                foreach (var item in items)
+                {
+                    if (item == null || string.IsNullOrEmpty(item.SteamId)) continue;
+                    if (string.IsNullOrEmpty(item.EventId)) item.EventId = NewEventId();
+                    Disconnects.Add(item);
+                }
             }
 
             public void EnqueueTeamChange(string kind, string teamId, string actorSteamId, string targetSteamId)
             {
                 if (string.IsNullOrEmpty(kind) || string.IsNullOrEmpty(teamId)) return;
-                _teamChanges.Add(new TeamChangeDto
+                TeamChanges.Add(new TeamChangeDto
                 {
+                    EventId = NewEventId(),
                     Kind = kind,
                     TeamId = teamId,
                     ActorSteamId = actorSteamId,
                     TargetSteamId = targetSteamId
                 });
+            }
+
+            public void EnqueueTeamChangeRange(List<TeamChangeDto> items)
+            {
+                if (items == null || items.Count == 0) return;
+                foreach (var item in items)
+                {
+                    if (item == null || string.IsNullOrEmpty(item.Kind) || string.IsNullOrEmpty(item.TeamId)) continue;
+                    if (string.IsNullOrEmpty(item.EventId)) item.EventId = NewEventId();
+                    TeamChanges.Add(item);
+                }
             }
 
             public void RequestSync(float delay)
@@ -995,48 +1221,62 @@ namespace Oxide.Plugins
                     Teams = fullSync ? Instance.SnapshotTeams() : null
                 };
 
-                _alertsInFlight = _alerts.Take(MaxBatchItems);
+                _alertsInFlight = Alerts.Take(MaxBatchItems);
                 if (_alertsInFlight.Count > 0) payload.Alerts = _alertsInFlight;
 
-                _disconnectsInFlight = _disconnects.Take(MaxDisconnectsPerHeartbeat);
+                _disconnectsInFlight = Disconnects.Take(MaxDisconnectsPerHeartbeat);
                 if (_disconnectsInFlight.Count > 0) payload.Disconnects = _disconnectsInFlight;
 
-                _teamChangesInFlight = _teamChanges.Take(MaxTeamChangesPerHeartbeat);
+                _teamChangesInFlight = TeamChanges.Take(MaxTeamChangesPerHeartbeat);
                 if (_teamChangesInFlight.Count > 0) payload.TeamChanges = _teamChangesInFlight;
 
                 Send<HeartbeatResponse>(HeartbeatPath, payload,
                     response =>
                     {
+                        int alertSent = _alertsInFlight?.Count ?? 0;
+                        int disconnectSent = _disconnectsInFlight?.Count ?? 0;
+                        int teamSent = _teamChangesInFlight?.Count ?? 0;
                         _alertsInFlight = null;
                         _disconnectsInFlight = null;
                         _teamChangesInFlight = null;
+                        Engine?.CommitSpool(SpoolKind.Alerts, alertSent);
+                        Engine?.CommitSpool(SpoolKind.Disconnects, disconnectSent);
+                        Engine?.CommitSpool(SpoolKind.TeamChanges, teamSent);
+                        if (response?.Mutes != null)
+                            Instance?.ReconcileMutes(response.Mutes);
                         if (response?.Tasks != null && response.Tasks.Count > 0)
                             Engine?.HandleTasks(response.Tasks);
                     },
                     (code, body) =>
                     {
-                        if (_alertsInFlight != null) _alerts.Requeue(_alertsInFlight);
+                        if (_alertsInFlight != null) Alerts.Requeue(_alertsInFlight);
                         _alertsInFlight = null;
-                        if (_disconnectsInFlight != null) _disconnects.Requeue(_disconnectsInFlight);
+                        if (_disconnectsInFlight != null) Disconnects.Requeue(_disconnectsInFlight);
                         _disconnectsInFlight = null;
-                        if (_teamChangesInFlight != null) _teamChanges.Requeue(_teamChangesInFlight);
+                        if (_teamChangesInFlight != null) TeamChanges.Requeue(_teamChangesInFlight);
                         _teamChangesInFlight = null;
                     });
             }
 
             protected override void Drain()
             {
-                var pending = _alerts.DrainAll();
-                if (_alertsInFlight != null)
+                Engine?.ReturnClaimed(SpoolKind.Alerts);
+                Engine?.ReturnClaimed(SpoolKind.Disconnects);
+                Engine?.ReturnClaimed(SpoolKind.TeamChanges);
+                FlushDrain(SpoolKind.Alerts, Alerts, ref _alertsInFlight);
+                FlushDrain(SpoolKind.Disconnects, Disconnects, ref _disconnectsInFlight);
+                FlushDrain(SpoolKind.TeamChanges, TeamChanges, ref _teamChangesInFlight);
+            }
+
+            private void FlushDrain<T>(SpoolKind kind, EventBuffer<T> buffer, ref List<T> inFlight)
+            {
+                var pending = buffer.DrainAll();
+                if (inFlight != null)
                 {
-                    pending.InsertRange(0, _alertsInFlight);
-                    _alertsInFlight = null;
+                    pending.InsertRange(0, inFlight);
+                    inFlight = null;
                 }
-                Engine?.Retain(SpoolKind.Alerts, pending);
-                _disconnectsInFlight = null;
-                _disconnects.DrainAll();
-                _teamChangesInFlight = null;
-                _teamChanges.DrainAll();
+                Engine?.SpoolItems(kind, pending);
             }
         }
 
@@ -1067,31 +1307,6 @@ namespace Oxide.Plugins
             }
         }
 
-        private class MuteWorker : RCoreWorker
-        {
-            protected override float Interval => MuteSweepInterval;
-
-            protected override void Tick()
-            {
-                int cleared = Instance?.SweepExpiredMutes() ?? 0;
-                if (cleared > 0) Log($"{cleared} mute(s) expired");
-            }
-        }
-
-        private class SpoolWorker : RCoreWorker
-        {
-            protected override float Interval => SpoolWriteInterval;
-
-            protected override void Tick()
-            {
-                var engine = Engine;
-                if (engine == null) return;
-
-                engine.RecoverSpool();
-                engine.WriteSpool();
-            }
-        }
-
         private class QueueWorker : RCoreWorker
         {
             private Dictionary<string, Func<JToken, TaskResult>> _handlers;
@@ -1107,9 +1322,21 @@ namespace Oxide.Plugins
                 }
             }
 
+            private Dictionary<string, TaskResult> PendingAck
+            {
+                get
+                {
+                    if (Instance?._tasks == null) return null;
+                    if (Instance._tasks.PendingAck == null)
+                        Instance._tasks.PendingAck = new Dictionary<string, TaskResult>();
+                    return Instance._tasks.PendingAck;
+                }
+            }
+
             protected override void Tick()
             {
                 Instance?.PruneProcessedTasks();
+                FlushAckIfIdle();
                 Poll();
             }
 
@@ -1118,7 +1345,11 @@ namespace Oxide.Plugins
                 if (!Ready || Instance == null || !Instance.IsLinked) return;
 
                 Send<List<QueueTaskDto>>(QueuePath, null,
-                    tasks => Dispatch(tasks), null, RequestMethod.GET);
+                    tasks =>
+                    {
+                        Dispatch(tasks);
+                        FlushAckIfIdle();
+                    }, null, RequestMethod.GET);
             }
 
             public void Dispatch(List<QueueTaskDto> tasks)
@@ -1132,28 +1363,33 @@ namespace Oxide.Plugins
                 {
                     if (task == null || string.IsNullOrEmpty(task.Type)) continue;
 
-                    if (string.IsNullOrEmpty(task.Id))
-                    {
-                        Warn($"task without id ignored: {task.Type}");
-                        continue;
-                    }
+                    if (string.IsNullOrEmpty(task.Id)) continue;
 
-                    if (handled++ >= MaxTasksPerAck) break;
-
-                    TaskResult processed;
-                    if (Instance.WasProcessed(task.Id, out processed))
-                    {
-                        if (processed != null) results[task.Id] = processed.AsReplay();
-                        continue;
-                    }
+                    if (handled >= MaxTasksPerAck) break;
+                    handled++;
 
                     Func<JToken, TaskResult> handler;
                     if (!Handlers.TryGetValue(task.Type, out handler))
                     {
-                        Warn($"unknown task type '{task.Type}'");
                         var unknown = TaskResult.Fail("UNKNOWN_TYPE", $"no handler for '{task.Type}'");
                         Instance.MarkProcessed(task.Id, unknown);
                         results[task.Id] = unknown;
+                        continue;
+                    }
+
+                    TaskResult processed;
+                    if (Instance.WasProcessed(task.Id, out processed))
+                    {
+                        if (IsIdempotentPunishment(task.Type))
+                        {
+                            try { handler(task.Data); }
+                            catch (Exception ex)
+                            {
+                                results[task.Id] = TaskResult.Fail("HANDLER_ERROR", ex.Message);
+                                continue;
+                            }
+                        }
+                        if (processed != null) results[task.Id] = processed.AsReplay();
                         continue;
                     }
 
@@ -1162,20 +1398,60 @@ namespace Oxide.Plugins
                     catch (Exception ex)
                     {
                         result = TaskResult.Fail("HANDLER_ERROR", ex.Message);
-                        Warn($"task '{task.Type}' threw: {ex.Message}");
                     }
 
                     Instance.MarkProcessed(task.Id, result);
                     results[task.Id] = result;
                 }
 
-                if (results.Count > 0) Acknowledge(results);
+                if (results.Count > 0)
+                {
+                    QueueAck(results);
+                    Instance.FlushProcessedTasksIfDirty(force: true);
+                }
             }
 
-            private void Acknowledge(Dictionary<string, TaskResult> results)
+            private void QueueAck(Dictionary<string, TaskResult> results)
             {
-                Send<JObject>(AckPath, new AckPayload { Results = results }, null,
-                    (code, body) => Warn($"task ack rejected ({code}): {Excerpt(body)}"));
+                if (results == null || results.Count == 0) return;
+                var pending = PendingAck;
+                if (pending == null) return;
+
+                foreach (var pair in results) pending[pair.Key] = pair.Value;
+                Instance._tasksDirty = true;
+                FlushAckIfIdle();
+            }
+
+            private bool _ackInFlight;
+
+            private void FlushAckIfIdle()
+            {
+                var pending = PendingAck;
+                if (pending == null || pending.Count == 0) return;
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                if (_ackInFlight) return;
+
+                var payload = new Dictionary<string, TaskResult>(pending);
+                _ackInFlight = true;
+
+                Send<JObject>(AckPath, new AckPayload { Results = payload },
+                    _ =>
+                    {
+                        _ackInFlight = false;
+                        var live = PendingAck;
+                        if (live == null) return;
+                        foreach (var key in payload.Keys) live.Remove(key);
+                        Instance._tasksDirty = true;
+                        Instance.FlushProcessedTasksIfDirty(force: true);
+                        FlushAckIfIdle();
+                    },
+                    (code, body) => { _ackInFlight = false; });
+            }
+
+            protected override void Drain()
+            {
+                FlushAckIfIdle();
+                Instance?.FlushProcessedTasksIfDirty(force: true);
             }
 
             public void ScheduleWriteCfg()
@@ -1187,33 +1463,59 @@ namespace Oxide.Plugins
             private void WriteCfg() => ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.writecfg");
         }
 
+        private class PolicyWorker : MonoBehaviour
+        {
+            private void Awake()
+            {
+                InvokeRepeating(nameof(Tick), UnityEngine.Random.Range(0.2f, 1f), PolicyFlushInterval);
+            }
+
+            private void OnDestroy()
+            {
+                CancelInvoke();
+            }
+
+            private void Tick()
+            {
+                Instance?.FlushPolicyQueue();
+            }
+        }
+
         #endregion
 
         #region Hooks
 
         private void OnNewSave(string filename)
         {
-            _pendingWipe = true;
+            SetPendingWipe(true);
             SendWipe();
         }
 
         private void OnClientAuth(Network.Connection connection)
         {
             if (!IsLinked || connection == null || !IsRealSteamId(connection.userid)) return;
-            BeginAutokickPrefetch(connection.userid.ToString(CultureInfo.InvariantCulture), CleanIp(connection.ipaddress));
+            EnqueuePolicyCheck(connection.userid.ToString(), CleanIp(connection.ipaddress));
         }
 
         private object CanUserLogin(string name, string id, string ipAddress)
         {
+            if (ulong.TryParse(id, out ulong uid))
+                _pendingKick.Remove(uid);
+
             return EvaluateLoginAutokick(id, ipAddress);
         }
 
         private void OnPlayerConnected(BasePlayer player)
         {
-            if (player == null) return;
-
             _voiceToastCooldowns.Remove(player.userID);
             _afkTrackers.Remove(player.userID);
+
+            if (_pendingKick.TryGetValue(player.userID, out string pendingReason))
+            {
+                _pendingKick.Remove(player.userID);
+                player.Kick(pendingReason);
+                return;
+            }
 
             if (IsLinked)
             {
@@ -1225,7 +1527,11 @@ namespace Oxide.Plugins
                 }
             }
 
-            if (IsLinked && IsRealSteamId(player.userID)) CheckAutokick(player);
+            if (IsLinked && IsRealSteamId(player.userID))
+            {
+                string ip = player.net?.connection != null ? CleanIp(player.net.connection.ipaddress) : "0.0.0.0";
+                ApplyCachedPolicyOrEnqueue(player.UserIDString, ip);
+            }
 
             string muteReason, muteTime;
             if (IsMuted(player, out muteReason, out muteTime))
@@ -1234,8 +1540,6 @@ namespace Oxide.Plugins
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
         {
-            if (player == null) return;
-
             _voiceToastCooldowns.Remove(player.userID);
             _afkTrackers.Remove(player.userID);
             _woundedHits.Remove(player.UserIDString);
@@ -1245,24 +1549,21 @@ namespace Oxide.Plugins
 
         private void OnTeamCreated(BasePlayer player, RelationshipManager.PlayerTeam team)
         {
-            if (player == null || team == null) return;
+            if (team == null) return;
             RecordTeamChange("created", team, player.UserIDString, player.UserIDString);
-            _engine?.RequestFullSync(1f);
         }
 
         private void OnTeamKick(RelationshipManager.PlayerTeam team, BasePlayer player, ulong target)
         {
-            if (team == null || player == null || !IsRealSteamId(target)) return;
+            if (team == null || !IsRealSteamId(target)) return;
             RecordTeamChange("kick", team, player.UserIDString, target.ToString());
-            _engine?.RequestFullSync(1f);
         }
 
         private void OnTeamLeave(RelationshipManager.PlayerTeam team, BasePlayer player)
         {
-            if (team == null || player == null) return;
+            if (team == null) return;
             if (team.members != null && team.members.Count == 1) return;
             RecordTeamChange("leave", team, player.UserIDString, player.UserIDString);
-            _engine?.RequestFullSync(1f);
         }
 
         private void OnTeamDisband(RelationshipManager.PlayerTeam team)
@@ -1275,7 +1576,6 @@ namespace Oxide.Plugins
                 string steamId = id.ToString();
                 RecordTeamChange("disband", team, steamId, steamId);
             }
-            _engine?.RequestFullSync(1f);
         }
 
         private void RecordTeamChange(string kind, RelationshipManager.PlayerTeam team, string actorSteamId, string targetSteamId)
@@ -1293,7 +1593,7 @@ namespace Oxide.Plugins
             if (body.StartsWith("/", StringComparison.Ordinal)) return null;
 
             string reason, timeLeft;
-            if (!IsMuted(connection.userid.ToString(CultureInfo.InvariantCulture), out reason, out timeLeft))
+            if (!IsMuted(connection.userid.ToString(), out reason, out timeLeft))
                 return null;
 
             var player = connection.player as BasePlayer;
@@ -1307,9 +1607,16 @@ namespace Oxide.Plugins
             return false;
         }
 
-        private object OnPlayerChat(BasePlayer player, string message, ConVar.Chat.ChatChannel channel)
+        private object OnUserChat(Oxide.Core.Libraries.Covalence.IPlayer player, string message)
         {
             if (player == null || string.IsNullOrWhiteSpace(message)) return null;
+            if (!IsMuted(player.Id)) return null;
+            return false;
+        }
+
+        private object OnPlayerChat(BasePlayer player, string message, ConVar.Chat.ChatChannel channel)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return null;
 
             string reason, timeLeft;
             if (IsMuted(player, out reason, out timeLeft))
@@ -1353,15 +1660,14 @@ namespace Oxide.Plugins
 
         private object OnPlayerVoice(BasePlayer player, byte[] data)
         {
-            if (player == null) return null;
-
-            string reason, timeLeft;
-            if (!IsMuted(player, out reason, out timeLeft)) return null;
+            MuteInfo mute;
+            if (!TryGetActiveMuteInfo(player.UserIDString, out mute)) return null;
 
             float lastWarning;
             if (!_voiceToastCooldowns.TryGetValue(player.userID, out lastWarning)
                 || UnityEngine.Time.realtimeSinceStartup - lastWarning > VoiceToastCooldown)
             {
+                string timeLeft = FormatTimeRemaining(mute.ExpiresAtParsed ?? ParseExpiry(mute.ExpiresAt));
                 SendToast(player, Message("Mute.VoiceBlocked", player, timeLeft));
                 _voiceToastCooldowns[player.userID] = UnityEngine.Time.realtimeSinceStartup;
             }
@@ -1457,14 +1763,19 @@ namespace Oxide.Plugins
 
             string sender = string.IsNullOrEmpty(task.Name) ? "Admin" : task.Name;
             int channel = task.Channel == "TEAM" ? 1 : 0;
-            string formatted = $"<size=12><color=#ffffffB3>Message from Administration</color></size>\n<color=#AAFF55>{sender}</color>: {content}";
 
-            ulong targetUid;
-            if (!string.IsNullOrEmpty(task.TargetSteamId) && ulong.TryParse(task.TargetSteamId, out targetUid))
+            bool hasTarget = !string.IsNullOrEmpty(task.TargetSteamId) && ulong.TryParse(task.TargetSteamId, out _);
+            string header = hasTarget
+                ? $"<color=#C4A882><size=12>Private message from Administrator {sender}</size></color>"
+                : $"<color=#C4A882><size=12>Message from Administrator {sender}</size></color>";
+            string formatted = $"{header}\n{content}";
+
+            if (hasTarget)
             {
-                var target = BasePlayer.FindByID(targetUid);
-                if (target == null || !target.IsConnected) return TaskResult.Fail("PLAYER_OFFLINE", "target is not connected");
-                target.SendConsoleCommand("chat.add", channel, _config.PanelAvatarSteamId, formatted);
+                BasePlayer target;
+                TaskResult error;
+                if (!TryResolvePlayer(task.TargetSteamId, out target, out error)) return error;
+                target.SendConsoleCommand("chat.add", channel, _config.AvatarSteamId, formatted);
                 return TaskResult.Ok();
             }
 
@@ -1478,9 +1789,6 @@ namespace Oxide.Plugins
             if (task == null || string.IsNullOrWhiteSpace(task.Command))
                 return TaskResult.Fail("EMPTY_COMMAND", "no command supplied");
 
-            string command = task.Command.Trim();
-            PrintWarning($"rejected remote command '{command}': remote commands are disabled");
-            _engine?.RaiseAlert("command_rejected", "remote commands disabled", new { command });
             return TaskResult.Fail("COMMANDS_DISABLED", "remote commands are disabled");
         }
 
@@ -1505,8 +1813,7 @@ namespace Oxide.Plugins
 
             _engine?.Queue?.ScheduleWriteCfg();
 
-            ulong uid;
-            if (ulong.TryParse(task.SteamId, out uid))
+            if (ulong.TryParse(task.SteamId, out ulong uid))
             {
                 var online = BasePlayer.FindByID(uid);
                 if (online != null && online.IsConnected) online.Kick("Banned: " + reason);
@@ -1539,6 +1846,9 @@ namespace Oxide.Plugins
             return TaskResult.Ok();
         }
 
+        private static bool IsIdempotentPunishment(string type) =>
+            type == "mute" || type == "unmute" || type == "ban" || type == "unban";
+
         private TaskResult HandleMuteTask(JToken raw)
         {
             var task = Parse<MuteTaskDto>(raw);
@@ -1550,9 +1860,10 @@ namespace Oxide.Plugins
                 return TaskResult.Fail("ALREADY_EXPIRED", "mute expiry is in the past");
 
             string reason = string.IsNullOrEmpty(task.Reason) ? "Rule Violation" : task.Reason;
-            ApplyMute(task.SteamId, reason, task.ExpiresAt, task.PlayerName);
+            bool alreadyMuted = IsMuted(task.SteamId);
+            ApplyMute(task.SteamId, reason, task.ExpiresAt, task.PlayerName, notify: !alreadyMuted);
 
-            if (task.Announce)
+            if (task.Announce && !alreadyMuted)
             {
                 AnnouncePublic(
                     "Mute.Announced",
@@ -1581,14 +1892,11 @@ namespace Oxide.Plugins
         private TaskResult HandleKickTask(JToken raw)
         {
             var task = Parse<KickTaskDto>(raw);
-            if (task == null || string.IsNullOrEmpty(task.SteamId))
-                return TaskResult.Fail("NO_TARGET", "steamId missing");
+            if (task == null) return TaskResult.Fail("NO_TARGET", "steamId missing");
 
-            ulong uid;
-            if (!ulong.TryParse(task.SteamId, out uid)) return TaskResult.Fail("BAD_STEAMID", task.SteamId);
-
-            var player = BasePlayer.FindByID(uid);
-            if (player == null || !player.IsConnected) return TaskResult.Fail("PLAYER_OFFLINE", "target is not connected");
+            BasePlayer player;
+            TaskResult error;
+            if (!TryResolvePlayer(task.SteamId, out player, out error)) return error;
 
             string reason = string.IsNullOrEmpty(task.Reason) ? Message("Kick.Default", player) : task.Reason;
             player.Kick(reason);
@@ -1598,23 +1906,18 @@ namespace Oxide.Plugins
         private TaskResult HandleTeleportTask(JToken raw)
         {
             var task = Parse<TeleportTaskDto>(raw);
-            if (task == null || string.IsNullOrEmpty(task.SteamId))
-                return TaskResult.Fail("NO_TARGET", "steamId missing");
+            if (task == null) return TaskResult.Fail("NO_TARGET", "steamId missing");
 
-            ulong uid;
-            if (!ulong.TryParse(task.SteamId, out uid)) return TaskResult.Fail("BAD_STEAMID", task.SteamId);
-
-            var player = BasePlayer.FindByID(uid);
-            if (player == null || !player.IsConnected) return TaskResult.Fail("PLAYER_OFFLINE", "target is not connected");
+            BasePlayer player;
+            TaskResult error;
+            if (!TryResolvePlayer(task.SteamId, out player, out error)) return error;
 
             Vector3 destination;
             if (!string.IsNullOrEmpty(task.TargetSteamId))
             {
-                ulong destUid;
-                if (!ulong.TryParse(task.TargetSteamId, out destUid)) return TaskResult.Fail("BAD_STEAMID", task.TargetSteamId);
-
-                var anchor = BasePlayer.FindByID(destUid);
-                if (anchor == null || !anchor.IsConnected) return TaskResult.Fail("PLAYER_OFFLINE", "destination player is not connected");
+                BasePlayer anchor;
+                if (!TryResolvePlayer(task.TargetSteamId, out anchor, out error, "destination player is not connected"))
+                    return error;
                 destination = anchor.transform.position;
             }
             else
@@ -1629,15 +1932,12 @@ namespace Oxide.Plugins
         private TaskResult HandleGiveTask(JToken raw)
         {
             var task = Parse<GiveTaskDto>(raw);
-            if (task == null || string.IsNullOrEmpty(task.SteamId))
-                return TaskResult.Fail("NO_TARGET", "steamId missing");
+            if (task == null) return TaskResult.Fail("NO_TARGET", "steamId missing");
             if (string.IsNullOrEmpty(task.Item)) return TaskResult.Fail("NO_ITEM", "item shortname missing");
 
-            ulong uid;
-            if (!ulong.TryParse(task.SteamId, out uid)) return TaskResult.Fail("BAD_STEAMID", task.SteamId);
-
-            var player = BasePlayer.FindByID(uid);
-            if (player == null || !player.IsConnected) return TaskResult.Fail("PLAYER_OFFLINE", "target is not connected");
+            BasePlayer player;
+            TaskResult error;
+            if (!TryResolvePlayer(task.SteamId, out player, out error)) return error;
 
             int amount = task.Amount > 0 ? task.Amount : 1;
             var item = ItemManager.CreateByName(task.Item, amount, task.SkinId);
@@ -1645,6 +1945,31 @@ namespace Oxide.Plugins
 
             player.GiveItem(item, BaseEntity.GiveItemReason.PickedUp);
             return TaskResult.Ok();
+        }
+
+        private bool TryResolvePlayer(string steamId, out BasePlayer player, out TaskResult error,
+                                      string offlineMessage = "target is not connected")
+        {
+            player = null;
+            error = null;
+            if (string.IsNullOrEmpty(steamId))
+            {
+                error = TaskResult.Fail("NO_TARGET", "steamId missing");
+                return false;
+            }
+            if (!ulong.TryParse(steamId, out ulong uid))
+            {
+                error = TaskResult.Fail("BAD_STEAMID", steamId);
+                return false;
+            }
+            player = BasePlayer.FindByID(uid);
+            if (player == null || !player.IsConnected)
+            {
+                player = null;
+                error = TaskResult.Fail("PLAYER_OFFLINE", offlineMessage);
+                return false;
+            }
+            return true;
         }
 
         private bool WasProcessed(string key, out TaskResult result)
@@ -1671,20 +1996,62 @@ namespace Oxide.Plugins
                 ExpiresAt = NowUnix() + TaskRetentionSeconds,
                 Result = result
             };
+
+            if (_tasks.Processed.Count > MaxProcessedTasks)
+                PruneProcessedTasks(force: true);
+
+            _tasksDirty = true;
         }
 
-        private void PruneProcessedTasks()
+        private void FlushProcessedTasksIfDirty(bool force = false)
+        {
+            if (!force && !_tasksDirty) return;
+            SaveProcessedTasks();
+        }
+
+        private void SaveProcessedTasks()
+        {
+            if (_tasks == null) return;
+            if (TrySave(TaskFileName, _tasks, "tasks"))
+                _tasksDirty = false;
+        }
+
+        private void PruneProcessedTasks(bool force = false)
         {
             if (_tasks?.Processed == null || _tasks.Processed.Count == 0) return;
 
+            bool removedAny = false;
             long now = NowUnix();
-            var stale = _tasks.Processed
-                .Where(entry => entry.Value == null || entry.Value.ExpiresAt <= now)
-                .Select(entry => entry.Key)
-                .ToList();
-            if (stale.Count == 0) return;
+            var stale = new List<string>();
+            foreach (var entry in _tasks.Processed)
+            {
+                if (entry.Value == null || entry.Value.ExpiresAt <= now)
+                    stale.Add(entry.Key);
+            }
+            foreach (var key in stale)
+            {
+                _tasks.Processed.Remove(key);
+                removedAny = true;
+            }
 
-            foreach (var key in stale) _tasks.Processed.Remove(key);
+            if (force && _tasks.Processed.Count > MaxProcessedTasks)
+            {
+                var ordered = new List<KeyValuePair<string, ProcessedTask>>(_tasks.Processed);
+                ordered.Sort((a, b) =>
+                {
+                    long ae = a.Value?.ExpiresAt ?? 0;
+                    long be = b.Value?.ExpiresAt ?? 0;
+                    return ae.CompareTo(be);
+                });
+                int remove = _tasks.Processed.Count - MaxProcessedTasks;
+                for (int i = 0; i < remove; i++)
+                {
+                    _tasks.Processed.Remove(ordered[i].Key);
+                    removedAny = true;
+                }
+            }
+
+            if (removedAny) _tasksDirty = true;
         }
 
         #endregion
@@ -1692,23 +2059,55 @@ namespace Oxide.Plugins
         #region Api
 
         private void Request(string path, string body, RequestMethod method,
-                             Action<int, string> onComplete, bool authenticated = true)
+                             Action<int, string> onComplete, bool authenticated = true,
+                             bool isAutokick = false)
         {
-            if (webrequest == null)
+            var pump = _engine?.Http;
+            if (pump == null)
             {
                 onComplete?.Invoke(0, null);
                 return;
             }
 
-            try
+            if (authenticated && !IsLinked)
             {
-                webrequest.Enqueue(BuildUrl(path), body, (code, response) => onComplete?.Invoke(code, response),
-                    this, method, BuildHeaders(authenticated), RequestTimeoutSeconds);
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"request to {path} could not be queued: {ex.Message}");
                 onComplete?.Invoke(0, null);
+                return;
+            }
+
+            var lane = isAutokick ? HttpLane.Auth : InferHttpLane(path);
+
+            pump.Enqueue(
+                BuildUrl(path),
+                ToHttpVerb(method),
+                BuildHeaders(authenticated),
+                body,
+                onComplete,
+                lane);
+        }
+
+        private static HttpLane InferHttpLane(string path)
+        {
+            switch (path)
+            {
+                case PairPath:
+                case VerifyPath:
+                case HeartbeatPath:
+                case QueuePath:
+                case AckPath:
+                case WipePath:
+                    return HttpLane.Control;
+                default:
+                    return HttpLane.Bulk;
+            }
+        }
+
+        private static string ToHttpVerb(RequestMethod method)
+        {
+            switch (method)
+            {
+                case RequestMethod.GET: return UnityWebRequest.kHttpVerbGET;
+                default: return UnityWebRequest.kHttpVerbPOST;
             }
         }
 
@@ -1725,18 +2124,206 @@ namespace Oxide.Plugins
             var headers = new Dictionary<string, string>
             {
                 ["Content-Type"] = "application/json",
-                ["X-RCore-Protocol"] = ProtocolVersion.ToString(CultureInfo.InvariantCulture),
-                ["X-RCore-Version"] = VersionString
+                ["X-RCore-Protocol"] = ProtocolVersion.ToString(),
+                ["X-RCore-Version"] = Version.ToString()
             };
 
             if (authenticated) headers["X-API-Key"] = _identity?.ApiKey ?? "";
             return headers;
         }
 
+        // auth lane separate so chat flood can't delay autokick
+        private enum HttpLane { Auth, Control, Bulk }
+
+        private class HttpPump : MonoBehaviour
+        {
+            private class HttpJob
+            {
+                public string Url;
+                public string Method;
+                public Dictionary<string, string> Headers;
+                public string Body;
+                public Action<int, string> OnComplete;
+                public HttpLane Lane;
+            }
+
+            private readonly Queue<HttpJob> _authQueue = new Queue<HttpJob>();
+            private readonly Queue<HttpJob> _controlQueue = new Queue<HttpJob>();
+            private readonly Queue<HttpJob> _bulkQueue = new Queue<HttpJob>();
+            private readonly List<HttpJob> _running = new List<HttpJob>();
+            private int _active;
+            private int _authInFlight;
+            private bool _destroyed;
+
+            public void Enqueue(string url, string method, Dictionary<string, string> headers,
+                                string body, Action<int, string> onComplete, HttpLane lane)
+            {
+                if (_destroyed)
+                {
+                    onComplete?.Invoke(0, null);
+                    return;
+                }
+
+                var target = QueueFor(lane);
+                int depthLimit = DepthLimitFor(lane);
+                if (target.Count >= depthLimit)
+                {
+                    onComplete?.Invoke(0, null);
+                    return;
+                }
+
+                target.Enqueue(new HttpJob
+                {
+                    Url = url,
+                    Method = method,
+                    Headers = headers,
+                    Body = body,
+                    OnComplete = onComplete,
+                    Lane = lane
+                });
+                Pump();
+            }
+
+            private static int DepthLimitFor(HttpLane lane)
+            {
+                switch (lane)
+                {
+                    case HttpLane.Auth: return MaxAuthQueueDepth;
+                    case HttpLane.Control: return MaxControlQueueDepth;
+                    default: return MaxBulkQueueDepth;
+                }
+            }
+
+            private Queue<HttpJob> QueueFor(HttpLane lane)
+            {
+                switch (lane)
+                {
+                    case HttpLane.Auth: return _authQueue;
+                    case HttpLane.Control: return _controlQueue;
+                    default: return _bulkQueue;
+                }
+            }
+
+            private void Pump()
+            {
+                while (_active < MaxHttpConcurrent)
+                {
+                    HttpJob job = null;
+
+                    if (_authQueue.Count > 0 && _authInFlight < MaxAuthHttpConcurrent)
+                        job = _authQueue.Dequeue();
+                    else if (_controlQueue.Count > 0)
+                        job = _controlQueue.Dequeue();
+                    else if (_bulkQueue.Count > 0)
+                        job = _bulkQueue.Dequeue();
+                    else break;
+
+                    _active++;
+                    if (job.Lane == HttpLane.Auth) _authInFlight++;
+                    _running.Add(job);
+                    StartCoroutine(Execute(job));
+                }
+            }
+
+            private IEnumerator Execute(HttpJob job)
+            {
+                int code = 0;
+                string text = null;
+                UnityWebRequest request = null;
+
+                try
+                {
+                    request = new UnityWebRequest(job.Url, job.Method)
+                    {
+                        downloadHandler = new DownloadHandlerBuffer(),
+                        timeout = Mathf.Max(1, (int)RequestTimeoutSeconds),
+                        redirectLimit = 0 // no redirects, keep api key on same host
+                    };
+
+                    if (!string.IsNullOrEmpty(job.Body))
+                    {
+                        byte[] raw = Encoding.UTF8.GetBytes(job.Body);
+                        request.uploadHandler = new UploadHandlerRaw(raw);
+                    }
+
+                    if (job.Headers != null)
+                    {
+                        foreach (var pair in job.Headers)
+                        {
+                            if (string.IsNullOrEmpty(pair.Key)) continue;
+                            request.SetRequestHeader(pair.Key, pair.Value ?? "");
+                        }
+                    }
+                }
+                catch
+                {
+                    Finish(job, 0, null);
+                    yield break;
+                }
+
+                yield return request.SendWebRequest();
+
+                try
+                {
+                    if (request.result == UnityWebRequest.Result.ConnectionError
+                        || request.result == UnityWebRequest.Result.DataProcessingError)
+                    {
+                        code = 0;
+                        text = null;
+                    }
+                    else
+                    {
+                        code = (int)request.responseCode;
+                        text = request.downloadHandler != null ? request.downloadHandler.text : null;
+                    }
+                }
+                catch
+                {
+                    code = 0;
+                    text = null;
+                }
+                finally
+                {
+                    request.Dispose();
+                }
+
+                Finish(job, code, text);
+            }
+
+            private void Finish(HttpJob job, int code, string text)
+            {
+                if (_destroyed) return;
+
+                _running.Remove(job);
+                _active = Mathf.Max(0, _active - 1);
+                if (job.Lane == HttpLane.Auth) _authInFlight = Mathf.Max(0, _authInFlight - 1);
+
+                job.OnComplete?.Invoke(code, text);
+                Pump();
+            }
+
+            private void OnDestroy()
+            {
+                _destroyed = true;
+                StopAllCoroutines();
+
+                var abandoned = new List<HttpJob>(_running.Count + _authQueue.Count + _controlQueue.Count + _bulkQueue.Count);
+                abandoned.AddRange(_running);
+                while (_authQueue.Count > 0) abandoned.Add(_authQueue.Dequeue());
+                while (_controlQueue.Count > 0) abandoned.Add(_controlQueue.Dequeue());
+                while (_bulkQueue.Count > 0) abandoned.Add(_bulkQueue.Dequeue());
+                _running.Clear();
+                _active = 0;
+                _authInFlight = 0;
+
+                foreach (var job in abandoned)
+                    job.OnComplete?.Invoke(0, null);
+            }
+        }
+
         private void SendWipe()
         {
             if (!IsLinked || !_pendingWipe) return;
-            _pendingWipe = false;
 
             var payload = new WipePayload
             {
@@ -1744,21 +2331,16 @@ namespace Oxide.Plugins
                 ServerId = _identity.ServerId,
                 CreatedAt = UtcNow(),
                 Level = ConVar.Server.level,
-
                 Seed = (uint)ConVar.Server.seed,
                 WorldSize = (uint)ConVar.Server.worldsize,
-                SaveCreatedTime = SafeSaveCreatedTime()
+                SaveCreatedTime = SaveRestore.SaveCreatedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
             };
 
             Request(WipePath, JsonConvert.SerializeObject(payload, Formatting.None), RequestMethod.POST,
                 (code, response) =>
                 {
-                    if (code < 200 || code >= 300)
-                    {
-                        PrintWarning($"wipe notification failed ({code}): {Excerpt(response)}");
-                        _pendingWipe = true;
-                        return;
-                    }
+                    if (code < 200 || code >= 300) return;
+                    SetPendingWipe(false);
                     _engine?.RequestFullSync(0.5f);
                 });
         }
@@ -1769,63 +2351,242 @@ namespace Oxide.Plugins
 
             string ip = CleanIp(ipAddress);
             AutokickCacheEntry cached;
-            if (!TryGetAutokickCache(steamId, ip, out cached) || !cached.Decided)
+            if (!TryGetAutokickCache(steamId, ip, out cached))
                 return null;
 
-            if (!cached.Kick) return null;
-            return AutokickReason(steamId, cached.Reason);
+            if (cached.Outcome == AutokickOutcome.Deny)
+                return AutokickReason(steamId, cached.Reason);
+
+            return null;
         }
 
-        private void BeginAutokickPrefetch(string steamId, string ip)
+        private void ApplyCachedPolicyOrEnqueue(string steamId, string ip)
         {
             AutokickCacheEntry cached;
-            if (TryGetAutokickCache(steamId, ip, out cached) && cached.Decided) return;
-
-            Request(AutokickCheckPath, SerializeAutokickRequest(steamId, ip), RequestMethod.POST, (code, response) =>
+            if (TryGetAutokickCache(steamId, ip, out cached))
             {
-                AutokickResponse result;
-                if (!TryParseAutokickResponse(code, response, out result)) return;
-                StoreAutokickCache(steamId, ip, result);
-            });
-        }
-
-        private void CheckAutokick(BasePlayer player)
-        {
-            if (player == null || !player.IsConnected) return;
-
-            string steamId = player.UserIDString;
-            string ip = player.net?.connection != null ? CleanIp(player.net.connection.ipaddress) : "0.0.0.0";
-            ulong uid = player.userID;
-
-            AutokickCacheEntry cached;
-            if (TryGetAutokickCache(steamId, ip, out cached) && cached.Decided)
-            {
-                if (!cached.Kick) return;
-                KickForAutokick(player, AutokickReason(steamId, cached.Reason));
+                if (cached.Outcome == AutokickOutcome.Deny)
+                    CloseConnection(steamId, AutokickReason(steamId, cached.Reason));
                 return;
             }
 
-            Request(AutokickCheckPath, SerializeAutokickRequest(steamId, ip), RequestMethod.POST, (code, response) =>
+            EnqueuePolicyCheck(steamId, ip);
+        }
+
+        private void EnqueuePolicyCheck(string steamId, string ip)
+        {
+            if (!IsLinked || !IsRealSteamId(steamId)) return;
+            if (string.IsNullOrEmpty(ip)) ip = "0.0.0.0";
+
+            AutokickCacheEntry cached;
+            if (TryGetAutokickCache(steamId, ip, out cached))
             {
-                AutokickResponse result;
-                if (!TryParseAutokickResponse(code, response, out result)) return;
+                if (cached.Outcome == AutokickOutcome.Deny)
+                    CloseConnection(steamId, AutokickReason(steamId, cached.Reason));
+                return;
+            }
 
-                StoreAutokickCache(steamId, ip, result);
-                if (!result.Kick) return;
+            PolicyPending existing;
+            if (_policyPending.TryGetValue(steamId, out existing) && existing != null)
+            {
+                existing.Ip = ip;
+                return;
+            }
 
-                NextFrame(() =>
+            if (_policyPending.Count >= MaxPolicyPending)
+            {
+                string oldestKey = null;
+                float oldestAt = float.MaxValue;
+                foreach (var pair in _policyPending)
                 {
-                    var target = BasePlayer.FindByID(uid);
-                    if (target == null || !target.IsConnected) return;
-                    KickForAutokick(target, AutokickReason(target.UserIDString, result.Reason));
-                });
+                    if (pair.Value.EnqueuedAt < oldestAt)
+                    {
+                        oldestAt = pair.Value.EnqueuedAt;
+                        oldestKey = pair.Key;
+                    }
+                }
+                if (oldestKey != null) _policyPending.Remove(oldestKey);
+            }
+
+            _policyPending[steamId] = new PolicyPending
+            {
+                Ip = ip,
+                EnqueuedAt = UnityEngine.Time.realtimeSinceStartup,
+                Attempts = 0
+            };
+        }
+
+        private void FlushPolicyQueue()
+        {
+            if (_policyInFlight) return;
+            if (!IsLinked || _engine?.Http == null) return;
+            if (_policyPending.Count == 0) return;
+
+            var batch = new List<AutokickPlayerDto>(Math.Min(MaxPolicyBatch, _policyPending.Count));
+            var taken = new List<string>(MaxPolicyBatch);
+            foreach (var pair in _policyPending)
+            {
+                if (batch.Count >= MaxPolicyBatch) break;
+                taken.Add(pair.Key);
+                batch.Add(new AutokickPlayerDto { SteamId = pair.Key, Ip = pair.Value.Ip });
+            }
+
+            if (batch.Count == 0) return;
+
+            for (int i = 0; i < taken.Count; i++)
+                _policyPending.Remove(taken[i]);
+
+            _policyInFlight = true;
+            int keyGen = _keyGeneration;
+            var payload = new AutokickBatchRequest
+            {
+                ServerId = _identity.ServerId,
+                Players = batch
+            };
+
+            Request(AutokickCheckPath, JsonConvert.SerializeObject(payload, Formatting.None), RequestMethod.POST,
+                (code, response) =>
+                {
+                    _policyInFlight = false;
+                    if (Instance == null) return;
+                    if (keyGen != _keyGeneration) return;
+
+                    if (TryParseAutokickBatchResponse(code, response, out AutokickBatchResponse parsed))
+                    {
+                        _policyFailures = 0;
+                        ApplyPolicyDecisions(parsed, batch);
+                        return;
+                    }
+
+                    _policyFailures = Math.Min(_policyFailures + 1, MaxPolicyAttempts);
+                    RequeuePolicyBatch(batch, code);
+                }, true, true);
+        }
+
+        private void RequeuePolicyBatch(List<AutokickPlayerDto> batch, int code)
+        {
+            if (batch == null || batch.Count == 0) return;
+
+            bool retry = IsTransientHttpFailure(code) && _policyFailures < MaxPolicyAttempts;
+            if (!retry)
+            {
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var p = batch[i];
+                    if (p == null || string.IsNullOrEmpty(p.SteamId)) continue;
+                    StoreAutokickCache(p.SteamId, p.Ip ?? "0.0.0.0", AutokickOutcome.Allow, null);
+                }
+                _policyFailures = 0;
+                return;
+            }
+
+            float delay = PolicyRetryDelay(_policyFailures);
+            timer.Once(delay, () =>
+            {
+                if (Instance == null || !IsLinked) return;
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var p = batch[i];
+                    if (p == null || string.IsNullOrEmpty(p.SteamId)) continue;
+                    PolicyPending existing;
+                    if (_policyPending.TryGetValue(p.SteamId, out existing) && existing != null)
+                    {
+                        existing.Ip = p.Ip ?? existing.Ip;
+                        existing.Attempts++;
+                        continue;
+                    }
+                    if (_policyPending.Count >= MaxPolicyPending) break;
+                    _policyPending[p.SteamId] = new PolicyPending
+                    {
+                        Ip = p.Ip ?? "0.0.0.0",
+                        EnqueuedAt = UnityEngine.Time.realtimeSinceStartup,
+                        Attempts = 1
+                    };
+                }
             });
         }
 
-        private void KickForAutokick(BasePlayer player, string reason)
+        private void ApplyPolicyDecisions(AutokickBatchResponse parsed, List<AutokickPlayerDto> sent)
         {
-            if (player == null || !player.IsConnected) return;
-            player.Kick(reason);
+            var bySteam = new Dictionary<string, AutokickDecisionDto>(StringComparer.Ordinal);
+            if (parsed?.Decisions != null)
+            {
+                for (int i = 0; i < parsed.Decisions.Count; i++)
+                {
+                    var d = parsed.Decisions[i];
+                    if (d == null || string.IsNullOrEmpty(d.SteamId)) continue;
+                    bySteam[d.SteamId] = d;
+                }
+            }
+
+            for (int i = 0; i < sent.Count; i++)
+            {
+                var p = sent[i];
+                if (p == null || string.IsNullOrEmpty(p.SteamId)) continue;
+
+                AutokickDecisionDto d;
+                if (!bySteam.TryGetValue(p.SteamId, out d) || d == null)
+                {
+                    StoreAutokickCache(p.SteamId, p.Ip ?? "0.0.0.0", AutokickOutcome.Allow, null);
+                    continue;
+                }
+
+                string decidedIp = string.IsNullOrEmpty(d.Ip) ? (p.Ip ?? "0.0.0.0") : d.Ip;
+                if (d.Kick)
+                {
+                    StoreAutokickCache(p.SteamId, decidedIp, AutokickOutcome.Deny, d.Reason);
+                    if (CurrentConnectionIp(p.SteamId, out string liveIp)
+                        && !string.Equals(liveIp, decidedIp, StringComparison.Ordinal))
+                    {
+                        EnqueuePolicyCheck(p.SteamId, liveIp);
+                        continue;
+                    }
+                    CloseConnection(p.SteamId, AutokickReason(p.SteamId, d.Reason));
+                }
+                else
+                {
+                    StoreAutokickCache(p.SteamId, decidedIp, AutokickOutcome.Allow, null);
+                }
+            }
+        }
+
+        private bool CurrentConnectionIp(string steamId, out string ip)
+        {
+            ip = null;
+            if (!ulong.TryParse(steamId, out ulong uid)) return false;
+
+            var player = BasePlayer.FindByID(uid);
+            if (player != null && player.IsConnected && player.net?.connection != null)
+            {
+                ip = CleanIp(player.net.connection.ipaddress);
+                return true;
+            }
+
+            Network.Connection found = FindConnection(uid);
+            if (found != null)
+            {
+                ip = CleanIp(found.ipaddress ?? "");
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsTransientHttpFailure(int code) =>
+            code == 0 || code == 429 || code >= 500;
+
+        private static float PolicyRetryDelay(int attempt)
+        {
+            float baseDelay = attempt <= 1 ? 1.5f : attempt == 2 ? 4f : 10f;
+            return baseDelay * UnityEngine.Random.Range(0.75f, 1.25f);
+        }
+
+        private void ClearAutokickState()
+        {
+            _autokickCache.Clear();
+            _policyPending.Clear();
+            _pendingKick.Clear();
+            _policyInFlight = false;
+            _policyFailures = 0;
         }
 
         private string AutokickReason(string steamId, string reason)
@@ -1835,23 +2596,13 @@ namespace Oxide.Plugins
                 : reason;
         }
 
-        private string SerializeAutokickRequest(string steamId, string ip)
-        {
-            return JsonConvert.SerializeObject(new AutokickRequest
-            {
-                ServerId = _identity.ServerId,
-                SteamId = steamId,
-                Ip = ip
-            }, Formatting.None);
-        }
-
-        private static bool TryParseAutokickResponse(int code, string response, out AutokickResponse result)
+        private static bool TryParseAutokickBatchResponse(int code, string response, out AutokickBatchResponse result)
         {
             result = null;
             if (code != 200 || string.IsNullOrEmpty(response)) return false;
-            try { result = JsonConvert.DeserializeObject<AutokickResponse>(response); }
+            try { result = JsonConvert.DeserializeObject<AutokickBatchResponse>(response); }
             catch { return false; }
-            return result != null;
+            return result != null && result.Decisions != null;
         }
 
         private bool TryGetAutokickCache(string steamId, string ip, out AutokickCacheEntry entry)
@@ -1869,23 +2620,22 @@ namespace Oxide.Plugins
             return true;
         }
 
-        private void StoreAutokickCache(string steamId, string ip, AutokickResponse result)
+        private void StoreAutokickCache(string steamId, string ip, AutokickOutcome outcome, string reason)
         {
-            if (result == null) return;
-            PruneAutokickCache();
+            PruneAutokickCache(force: _autokickCache.Count >= MaxAutokickCacheEntries);
             _autokickCache[steamId] = new AutokickCacheEntry
             {
                 Ip = ip,
-                Decided = true,
-                Kick = result.Kick,
-                Reason = result.Reason,
+                Outcome = outcome,
+                Reason = reason,
                 At = UnityEngine.Time.realtimeSinceStartup
             };
         }
 
-        private void PruneAutokickCache()
+        private void PruneAutokickCache(bool force = false)
         {
-            if (_autokickCache.Count < 64) return;
+            if (!force && _autokickCache.Count < MaxAutokickCacheEntries) return;
+
             float now = UnityEngine.Time.realtimeSinceStartup;
             var stale = new List<string>();
             foreach (var pair in _autokickCache)
@@ -1893,54 +2643,133 @@ namespace Oxide.Plugins
                 if (now - pair.Value.At > AutokickCacheTtl) stale.Add(pair.Key);
             }
             foreach (var key in stale) _autokickCache.Remove(key);
+
+            if (_autokickCache.Count <= MaxAutokickCacheEntries) return;
+
+            var ordered = new List<KeyValuePair<string, AutokickCacheEntry>>(_autokickCache);
+            ordered.Sort((a, b) => a.Value.At.CompareTo(b.Value.At));
+            int remove = _autokickCache.Count - MaxAutokickCacheEntries;
+            for (int i = 0; i < remove; i++) _autokickCache.Remove(ordered[i].Key);
+        }
+
+        private bool CloseConnection(string steamId, string reason)
+        {
+            if (!ulong.TryParse(steamId, out ulong targetUserId))
+                return false;
+
+            if (string.IsNullOrEmpty(reason))
+                reason = lang.GetMessage("Autokick.Default", this, steamId);
+
+            var player = BasePlayer.FindByID(targetUserId);
+            if (player != null && player.IsConnected)
+            {
+                player.Kick(reason);
+                return true;
+            }
+
+            Network.Connection connection = FindConnection(targetUserId);
+            if (connection != null)
+            {
+                Network.Net.sv.Kick(connection, reason);
+                return true;
+            }
+
+            _pendingKick[targetUserId] = reason;
+            return true;
+        }
+
+        private static Network.Connection FindConnection(ulong userid)
+        {
+            var authList = ConnectionAuth.m_AuthConnection;
+            if (authList != null)
+            {
+                for (int i = 0; i < authList.Count; i++)
+                {
+                    var c = authList[i];
+                    if (c != null && c.userid == userid) return c;
+                }
+            }
+
+            var queue = ServerMgr.Instance?.connectionQueue;
+            if (queue != null)
+            {
+                if (queue.joining != null)
+                {
+                    for (int i = 0; i < queue.joining.Count; i++)
+                    {
+                        var c = queue.joining[i];
+                        if (c != null && c.userid == userid) return c;
+                    }
+                }
+                if (queue.queue != null)
+                {
+                    for (int i = 0; i < queue.queue.Count; i++)
+                    {
+                        var c = queue.queue[i];
+                        if (c != null && c.userid == userid) return c;
+                    }
+                }
+            }
+
+            var steamWaiting = Auth_Steam.waitingList;
+            if (steamWaiting != null)
+            {
+                for (int i = 0; i < steamWaiting.Count; i++)
+                {
+                    var c = steamWaiting[i];
+                    if (c != null && c.userid == userid) return c;
+                }
+            }
+
+            return null;
         }
 
         private List<PlayerDto> SnapshotPlayers()
         {
-            var players = new List<PlayerDto>();
+            var players = new List<PlayerDto>(BasePlayer.activePlayerList.Count + 32);
             float now = UnityEngine.Time.realtimeSinceStartup;
 
-            try
+            foreach (var player in BasePlayer.activePlayerList)
             {
-                foreach (var player in BasePlayer.activePlayerList)
+                if (player == null || !player.IsConnected) continue;
+
+                string ip = player.net?.connection != null ? CleanIp(player.net.connection.ipaddress) : "0.0.0.0";
+                var position = player.transform.position;
+
+                long afkSeconds = 0;
+                AfkTracker tracker;
+                if (_afkTrackers.TryGetValue(player.userID, out tracker))
                 {
-                    if (player == null || !player.IsConnected) continue;
-
-                    string ip = player.net?.connection != null ? CleanIp(player.net.connection.ipaddress) : "0.0.0.0";
-                    var position = player.transform.position;
-
-                    long afkSeconds = 0;
-                    AfkTracker tracker;
-                    if (_afkTrackers.TryGetValue(player.userID, out tracker))
-                    {
-                        if (Vector3.Distance(position, tracker.LastPosition) > 1f)
-                            _afkTrackers[player.userID] = new AfkTracker { LastPosition = position, LastMoveTime = now };
-                        else
-                            afkSeconds = (long)(now - tracker.LastMoveTime);
-                    }
-                    else
-                    {
+                    if (Vector3.Distance(position, tracker.LastPosition) > 1f)
                         _afkTrackers[player.userID] = new AfkTracker { LastPosition = position, LastMoveTime = now };
-                    }
-
-                    players.Add(new PlayerDto
-                    {
-                        SteamId = player.UserIDString,
-                        Name = player.displayName ?? "Unknown",
-                        Ip = ip,
-                        Ping = (Network.Net.sv != null && player.net?.connection != null)
-                            ? Network.Net.sv.GetAveragePing(player.net.connection)
-                            : 0,
-                        ConnectedSeconds = player.net?.connection != null ? (long)player.net.connection.GetSecondsConnected() : 0,
-                        Health = player.Health(),
-                        IsAdmin = player.IsAdmin,
-                        AfkSeconds = afkSeconds,
-                        Status = "online"
-                    });
+                    else
+                        afkSeconds = (long)(now - tracker.LastMoveTime);
+                }
+                else
+                {
+                    _afkTrackers[player.userID] = new AfkTracker { LastPosition = position, LastMoveTime = now };
                 }
 
-                var queue = ServerMgr.Instance?.connectionQueue;
-                if (queue != null)
+                players.Add(new PlayerDto
+                {
+                    SteamId = player.UserIDString,
+                    Name = player.displayName ?? "Unknown",
+                    Ip = ip,
+                    Ping = (Network.Net.sv != null && player.net?.connection != null)
+                        ? Network.Net.sv.GetAveragePing(player.net.connection)
+                        : 0,
+                    ConnectedSeconds = player.net?.connection != null ? (long)player.net.connection.GetSecondsConnected() : 0,
+                    Health = player.Health(),
+                    IsAdmin = player.IsAdmin,
+                    AfkSeconds = afkSeconds,
+                    Status = "online"
+                });
+            }
+
+            var queue = ServerMgr.Instance?.connectionQueue;
+            if (queue != null)
+            {
+                if (queue.joining != null)
                 {
                     foreach (var connection in queue.joining)
                     {
@@ -1953,7 +2782,10 @@ namespace Oxide.Plugins
                             Status = "connecting"
                         });
                     }
+                }
 
+                if (queue.queue != null)
+                {
                     foreach (var connection in queue.queue)
                     {
                         if (connection == null || connection.userid == 0) continue;
@@ -1967,52 +2799,40 @@ namespace Oxide.Plugins
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                PrintWarning($"player snapshot failed: {ex.Message}");
-            }
 
             return players;
         }
 
         private List<TeamDto> SnapshotTeams()
         {
-            try
-            {
-                var instance = RelationshipManager.ServerInstance;
-                if (instance == null || instance.teams == null)
-                    return new List<TeamDto>();
+            var instance = RelationshipManager.ServerInstance;
+            if (instance == null || instance.teams == null)
+                return new List<TeamDto>();
 
-                var result = new List<TeamDto>(instance.teams.Count);
-                foreach (var pair in instance.teams)
+            var result = new List<TeamDto>(instance.teams.Count);
+            foreach (var pair in instance.teams)
+            {
+                var team = pair.Value;
+                if (team == null || team.members == null || team.members.Count == 0)
+                    continue;
+
+                var members = new List<string>(team.members.Count);
+                for (int i = 0; i < team.members.Count; i++)
                 {
-                    var team = pair.Value;
-                    if (team == null || team.members == null || team.members.Count == 0)
-                        continue;
-
-                    var members = new List<string>(team.members.Count);
-                    for (int i = 0; i < team.members.Count; i++)
-                    {
-                        ulong id = team.members[i];
-                        if (!IsRealSteamId(id)) continue;
-                        members.Add(id.ToString());
-                    }
-                    if (members.Count == 0) continue;
-
-                    result.Add(new TeamDto
-                    {
-                        TeamId = team.teamID.ToString(),
-                        LeaderSteamId = IsRealSteamId(team.teamLeader) ? team.teamLeader.ToString() : null,
-                        Members = members
-                    });
+                    ulong id = team.members[i];
+                    if (!IsRealSteamId(id)) continue;
+                    members.Add(id.ToString());
                 }
-                return result;
+                if (members.Count == 0) continue;
+
+                result.Add(new TeamDto
+                {
+                    TeamId = team.teamID.ToString(),
+                    LeaderSteamId = IsRealSteamId(team.teamLeader) ? team.teamLeader.ToString() : null,
+                    Members = members
+                });
             }
-            catch (Exception ex)
-            {
-                PrintWarning("team snapshot failed: " + ex.Message);
-                return null;
-            }
+            return result;
         }
 
         private ServerInfoDto SnapshotServer()
@@ -2027,16 +2847,16 @@ namespace Oxide.Plugins
                 Seed = (uint)ConVar.Server.seed,
                 WorldSize = (uint)ConVar.Server.worldsize,
                 Port = ConVar.Server.port,
-                DisplayIp = SafeServerIp(),
+                DisplayIp = (string.IsNullOrWhiteSpace(ConVar.Server.ip) || ConVar.Server.ip == "0.0.0.0" ? null : ConVar.Server.ip),
                 UptimeSeconds = (long)UnityEngine.Time.realtimeSinceStartup,
-                MemoryUsedMb = SafeMemoryUsedMb(),
+                MemoryUsedMb = (long)Performance.current.memoryUsageSystem,
                 QueuedCount = queue?.queue?.Count ?? 0,
                 JoiningCount = queue?.joining?.Count ?? 0,
-                SaveCreatedTime = SafeSaveCreatedTime(),
-                PluginVersion = VersionString,
+                SaveCreatedTime = SaveRestore.SaveCreatedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                PluginVersion = Version.ToString(),
                 ProtocolVersion = ProtocolVersion,
                 Framework = Framework,
-                RustProtocol = SafeRustProtocol(),
+                RustProtocol = Rust.Protocol.printable,
                 HeaderImage = ConVar.Server.headerimage,
                 LogoImage = ConVar.Server.logoimage
             };
@@ -2082,7 +2902,8 @@ namespace Oxide.Plugins
 
         #region Models
 
-        private enum SpoolKind { Chat, Reports, Deaths, Alerts }
+        private enum SpoolKind { Chat = 0, Reports, Deaths, Alerts, Disconnects, TeamChanges }
+        private const int SpoolKindCount = 6;
 
         private class IdentityData
         {
@@ -2092,17 +2913,21 @@ namespace Oxide.Plugins
             public string ProjectId;
             public string PairedAtUtc;
             public string LastError;
+            public bool PendingWipe;
         }
 
         private class MuteInfo
         {
-            public string Reason;
-            public string ExpiresAt;
+            [JsonProperty("Reason")] public string Reason { get; set; }
+            [JsonProperty("ExpiresAt")] public string ExpiresAt { get; set; }
+            [JsonIgnore] public DateTimeOffset? ExpiresAtParsed;
         }
 
         private class MuteStore
         {
-            public Dictionary<string, MuteInfo> ActiveMutes = new Dictionary<string, MuteInfo>();
+            [JsonProperty("ActiveMutes")]
+            public Dictionary<string, MuteInfo> ActiveMutes { get; set; }
+                = new Dictionary<string, MuteInfo>();
         }
 
         private class ProcessedTask
@@ -2114,21 +2939,100 @@ namespace Oxide.Plugins
         private class ProcessedTaskStore
         {
             public Dictionary<string, ProcessedTask> Processed = new Dictionary<string, ProcessedTask>();
+            public Dictionary<string, TaskResult> PendingAck = new Dictionary<string, TaskResult>();
         }
 
         private class SpoolStore
         {
-            [JsonProperty("chat")] public List<JToken> Chat = new List<JToken>();
-            [JsonProperty("reports")] public List<JToken> Reports = new List<JToken>();
-            [JsonProperty("deaths")] public List<JToken> Deaths = new List<JToken>();
-            [JsonProperty("alerts")] public List<JToken> Alerts = new List<JToken>();
+            [JsonIgnore] public List<JToken>[] Pending = AllocBuckets();
+            [JsonIgnore] public List<JToken>[] InFlight = AllocBuckets();
+
+            [JsonProperty("chat")]
+            public List<JToken> Chat { get => Pending[0]; set => Pending[0] = value ?? new List<JToken>(); }
+            [JsonProperty("reports")]
+            public List<JToken> Reports { get => Pending[1]; set => Pending[1] = value ?? new List<JToken>(); }
+            [JsonProperty("deaths")]
+            public List<JToken> Deaths { get => Pending[2]; set => Pending[2] = value ?? new List<JToken>(); }
+            [JsonProperty("alerts")]
+            public List<JToken> Alerts { get => Pending[3]; set => Pending[3] = value ?? new List<JToken>(); }
+            [JsonProperty("disconnects")]
+            public List<JToken> Disconnects { get => Pending[4]; set => Pending[4] = value ?? new List<JToken>(); }
+            [JsonProperty("teamChanges")]
+            public List<JToken> TeamChanges { get => Pending[5]; set => Pending[5] = value ?? new List<JToken>(); }
+
+            [JsonProperty("chatInFlight")]
+            public List<JToken> ChatInFlight { get => InFlight[0]; set => InFlight[0] = value ?? new List<JToken>(); }
+            [JsonProperty("reportsInFlight")]
+            public List<JToken> ReportsInFlight { get => InFlight[1]; set => InFlight[1] = value ?? new List<JToken>(); }
+            [JsonProperty("deathsInFlight")]
+            public List<JToken> DeathsInFlight { get => InFlight[2]; set => InFlight[2] = value ?? new List<JToken>(); }
+            [JsonProperty("alertsInFlight")]
+            public List<JToken> AlertsInFlight { get => InFlight[3]; set => InFlight[3] = value ?? new List<JToken>(); }
+            [JsonProperty("disconnectsInFlight")]
+            public List<JToken> DisconnectsInFlight { get => InFlight[4]; set => InFlight[4] = value ?? new List<JToken>(); }
+            [JsonProperty("teamChangesInFlight")]
+            public List<JToken> TeamChangesInFlight { get => InFlight[5]; set => InFlight[5] = value ?? new List<JToken>(); }
+
+            private static List<JToken>[] AllocBuckets()
+            {
+                var arr = new List<JToken>[SpoolKindCount];
+                for (int i = 0; i < SpoolKindCount; i++) arr[i] = new List<JToken>();
+                return arr;
+            }
+
+            private void EnsureBuckets()
+            {
+                if (Pending == null || Pending.Length != SpoolKindCount) Pending = AllocBuckets();
+                if (InFlight == null || InFlight.Length != SpoolKindCount) InFlight = AllocBuckets();
+                for (int i = 0; i < SpoolKindCount; i++)
+                {
+                    if (Pending[i] == null) Pending[i] = new List<JToken>();
+                    if (InFlight[i] == null) InFlight[i] = new List<JToken>();
+                }
+            }
 
             public void Normalize()
             {
-                if (Chat == null) Chat = new List<JToken>();
-                if (Reports == null) Reports = new List<JToken>();
-                if (Deaths == null) Deaths = new List<JToken>();
-                if (Alerts == null) Alerts = new List<JToken>();
+                EnsureBuckets();
+                for (int i = 0; i < SpoolKindCount; i++)
+                {
+                    Pending[i] = ClampPending(Pending[i]);
+                    InFlight[i] = EnsureList(InFlight[i]);
+                }
+            }
+
+            public bool ReclaimInFlight()
+            {
+                EnsureBuckets();
+                bool dirty = false;
+                for (int i = 0; i < SpoolKindCount; i++)
+                    dirty |= ReclaimOne(Pending[i], InFlight[i]);
+                if (dirty) Normalize();
+                else
+                {
+                    for (int i = 0; i < SpoolKindCount; i++)
+                        Pending[i] = ClampPending(Pending[i]);
+                }
+                return dirty;
+            }
+
+            private static bool ReclaimOne(List<JToken> pending, List<JToken> inFlight)
+            {
+                if (pending == null || inFlight == null || inFlight.Count == 0) return false;
+                pending.InsertRange(0, inFlight);
+                inFlight.Clear();
+                return true;
+            }
+
+            private static List<JToken> EnsureList(List<JToken> source) =>
+                source ?? new List<JToken>();
+
+            private static List<JToken> ClampPending(List<JToken> source)
+            {
+                source = EnsureList(source);
+                if (source.Count <= MaxBufferItems) return source;
+                source.RemoveRange(0, source.Count - MaxBufferItems);
+                return source;
             }
         }
 
@@ -2170,6 +3074,7 @@ namespace Oxide.Plugins
             [JsonProperty("replayed", NullValueHandling = NullValueHandling.Ignore)] public bool? Replayed { get; set; }
 
             public static TaskResult Ok() => new TaskResult { Success = true, Code = "OK" };
+
             public static TaskResult Fail(string code, string message) =>
                 new TaskResult { Success = false, Code = code, Message = message };
 
@@ -2237,6 +3142,7 @@ namespace Oxide.Plugins
 
         private class DisconnectDto
         {
+            [JsonProperty("eventId", NullValueHandling = NullValueHandling.Ignore)] public string EventId { get; set; }
             [JsonProperty("steamId")] public string SteamId { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
         }
@@ -2250,6 +3156,7 @@ namespace Oxide.Plugins
 
         private class TeamChangeDto
         {
+            [JsonProperty("eventId", NullValueHandling = NullValueHandling.Ignore)] public string EventId { get; set; }
             [JsonProperty("kind")] public string Kind { get; set; }
             [JsonProperty("teamId")] public string TeamId { get; set; }
             [JsonProperty("actorSteamId")] public string ActorSteamId { get; set; }
@@ -2260,6 +3167,14 @@ namespace Oxide.Plugins
         {
             [JsonProperty("ok")] public bool Ok { get; set; }
             [JsonProperty("tasks")] public List<QueueTaskDto> Tasks { get; set; }
+            [JsonProperty("mutes")] public List<MuteSyncDto> Mutes { get; set; }
+        }
+
+        private class MuteSyncDto
+        {
+            [JsonProperty("steamId")] public string SteamId { get; set; }
+            [JsonProperty("reason")] public string Reason { get; set; }
+            [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
         }
 
         private class ServerInfoDto
@@ -2378,26 +3293,46 @@ namespace Oxide.Plugins
             [JsonProperty("saveCreatedTime")] public string SaveCreatedTime { get; set; }
         }
 
-        private class AutokickRequest
+        private class AutokickPlayerDto
         {
-            [JsonProperty("serverId")] public string ServerId { get; set; }
             [JsonProperty("steamId")] public string SteamId { get; set; }
             [JsonProperty("ip")] public string Ip { get; set; }
         }
 
-        private class AutokickResponse
+        private class AutokickBatchRequest
         {
+            [JsonProperty("serverId")] public string ServerId { get; set; }
+            [JsonProperty("players")] public List<AutokickPlayerDto> Players { get; set; }
+        }
+
+        private class AutokickDecisionDto
+        {
+            [JsonProperty("steamId")] public string SteamId { get; set; }
+            [JsonProperty("ip")] public string Ip { get; set; }
             [JsonProperty("kick")] public bool Kick { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
         }
 
+        private class AutokickBatchResponse
+        {
+            [JsonProperty("decisions")] public List<AutokickDecisionDto> Decisions { get; set; }
+        }
+
+        private enum AutokickOutcome { Allow, Deny }
+
         private class AutokickCacheEntry
         {
             public string Ip;
-            public bool Decided;
-            public bool Kick;
+            public AutokickOutcome Outcome;
             public string Reason;
             public float At;
+        }
+
+        private class PolicyPending
+        {
+            public string Ip;
+            public float EnqueuedAt;
+            public int Attempts;
         }
 
         private class AckPayload
@@ -2479,12 +3414,17 @@ namespace Oxide.Plugins
 
         private class EventBuffer<T>
         {
-            private readonly List<T> _items = new List<T>();
+            private readonly LinkedList<T> _items = new LinkedList<T>();
             private readonly string _label;
-            private int _dropped;
-            private float _lastDropWarn = -999f;
+            private readonly Action<T> _durableSpill;
+            private int _spilled;
+            private float _lastSpillWarn = -999f;
 
-            public EventBuffer(string label) { _label = label; }
+            public EventBuffer(string label, Action<T> durableSpill = null)
+            {
+                _label = label;
+                _durableSpill = durableSpill;
+            }
 
             public int Count => _items.Count;
 
@@ -2492,12 +3432,8 @@ namespace Oxide.Plugins
             {
                 if (item == null) return;
                 if (_items.Count >= MaxBufferItems)
-                {
-                    _items.RemoveAt(0);
-                    _dropped++;
-                    WarnOnOverflow();
-                }
-                _items.Add(item);
+                    EvictOldest();
+                _items.AddLast(item);
             }
 
             public void AddRange(IEnumerable<T> items)
@@ -2509,42 +3445,58 @@ namespace Oxide.Plugins
             public List<T> Take(int max)
             {
                 int count = Math.Min(_items.Count, max);
-                var batch = _items.GetRange(0, count);
-                _items.RemoveRange(0, count);
+                var batch = new List<T>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    batch.Add(_items.First.Value);
+                    _items.RemoveFirst();
+                }
                 return batch;
             }
 
             public void Requeue(List<T> batch)
             {
                 if (batch == null || batch.Count == 0) return;
-                _items.InsertRange(0, batch);
-                TrimOverflow();
+                for (int i = batch.Count - 1; i >= 0; i--)
+                {
+                    if (batch[i] == null) continue;
+                    _items.AddFirst(batch[i]);
+                }
+                while (_items.Count > MaxBufferItems)
+                    EvictOldest();
             }
 
             public List<T> DrainAll()
             {
-                var all = new List<T>(_items);
-                _items.Clear();
+                var all = new List<T>(_items.Count);
+                while (_items.Count > 0)
+                {
+                    all.Add(_items.First.Value);
+                    _items.RemoveFirst();
+                }
                 return all;
             }
 
-            private void TrimOverflow()
+            private void EvictOldest()
             {
-                while (_items.Count > MaxBufferItems)
-                {
-                    _items.RemoveAt(0);
-                    _dropped++;
-                }
-                if (_dropped > 0) WarnOnOverflow();
+                if (_items.Count == 0) return;
+                var oldest = _items.First.Value;
+                _items.RemoveFirst();
+
+                _durableSpill?.Invoke(oldest);
+
+                _spilled++;
+                NoteSpill();
             }
 
-            private void WarnOnOverflow()
+            private void NoteSpill()
             {
                 float now = UnityEngine.Time.realtimeSinceStartup;
-                if (now - _lastDropWarn < DropWarnInterval) return;
-                _lastDropWarn = now;
-                Warn($"{_label} buffer is full ({MaxBufferItems}); {_dropped} event(s) dropped so far");
-                Instance?._engine?.RaiseAlert("buffer_overflow", $"{_label} dropped {_dropped} events", new { buffer = _label, dropped = _dropped });
+                if (now - _lastSpillWarn < DropWarnInterval) return;
+                _lastSpillWarn = now;
+                string mode = _durableSpill != null ? "spilled to disk" : "dropped";
+                Instance?._engine?.RaiseAlert("buffer_overflow", $"{_label} {_spilled} events {mode}",
+                    new { buffer = _label, spilled = _spilled, durable = _durableSpill != null });
             }
         }
 
@@ -2556,8 +3508,7 @@ namespace Oxide.Plugins
 
         private static bool IsRealSteamId(string id)
         {
-            ulong steamId;
-            return ulong.TryParse(id, NumberStyles.Integer, CultureInfo.InvariantCulture, out steamId)
+            return ulong.TryParse(id, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong steamId)
                 && IsRealSteamId(steamId);
         }
 
@@ -2567,29 +3518,7 @@ namespace Oxide.Plugins
 
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        private static void Log(string message) => Instance?.Puts(message);
-
-        private static void Warn(string message) => Instance?.PrintWarning(message);
-
-        private static string SummarizeHttpFailure(int code, string body)
-        {
-            if (code == 0) return "no response (network error or timeout)";
-            var excerpt = Excerpt(body);
-            return excerpt.Length == 0 ? $"HTTP {code} with an empty body" : excerpt;
-        }
-
-        private static string DescribeAuthFailure(int code, string body)
-        {
-            string errorCode, ignored;
-            if (TryReadErrorCode(body, out errorCode, out ignored)
-                && string.Equals(errorCode, CodeInvalidApiKey, StringComparison.OrdinalIgnoreCase))
-            {
-                var backend = Instance != null ? Instance.ApiBaseUrl : DefaultApiBaseUrl;
-                return $"{CodeInvalidApiKey} at {backend} — key unknown here. Fix ApiBaseUrl in config if this is not the right backend, then rcore.unlink && rcore.pair <CODE>";
-            }
-
-            return SummarizeHttpFailure(code, body);
-        }
+        private static void Announce(string message) => Instance?.Puts(message);
 
         private static bool TryReadErrorCode(string body, out string code, out string message)
         {
@@ -2606,28 +3535,6 @@ namespace Oxide.Plugins
             return !string.IsNullOrEmpty(code);
         }
 
-        private static string Excerpt(string value)
-        {
-            if (string.IsNullOrEmpty(value)) return "";
-
-            var trimmed = value.TrimStart();
-            if (LooksLikeHtml(trimmed))
-                return "HTML error page (tunnel/proxy down or misrouted — not the API)";
-
-            const int max = 160;
-            var oneLine = trimmed.Replace('\r', ' ').Replace('\n', ' ');
-            return oneLine.Length <= max ? oneLine : oneLine.Substring(0, max) + "…";
-        }
-
-        private static bool LooksLikeHtml(string value)
-        {
-            if (value.Length == 0) return false;
-            if (value[0] == '<') return true;
-            var sample = value.Length > 256 ? value.Substring(0, 256) : value;
-            return sample.IndexOf("<html", StringComparison.OrdinalIgnoreCase) >= 0
-                || sample.IndexOf("<!DOCTYPE", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
         private static string ConnectionName(string username, string fallback) =>
             string.IsNullOrEmpty(username) || username == "<blank>" ? fallback : username;
 
@@ -2635,11 +3542,7 @@ namespace Oxide.Plugins
         {
             if (raw == null) return null;
             try { return raw.ToObject<T>(); }
-            catch (Exception ex)
-            {
-                Warn($"task payload could not be read as {typeof(T).Name}: {ex.Message}");
-                return null;
-            }
+            catch { return null; }
         }
 
         private static string CleanIp(string ip)
@@ -2647,35 +3550,6 @@ namespace Oxide.Plugins
             if (string.IsNullOrEmpty(ip)) return "0.0.0.0";
             int index = ip.LastIndexOf(':');
             return index != -1 ? ip.Substring(0, index) : ip;
-        }
-
-        private static string SafeServerIp()
-        {
-            try
-            {
-                var ip = ConVar.Server.ip;
-                return string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0" ? null : ip;
-            }
-            catch { return null; }
-        }
-
-        private static long SafeMemoryUsedMb()
-        {
-            try { return (long)Performance.current.memoryUsageSystem; }
-
-            catch { return System.GC.GetTotalMemory(false) / 1048576; }
-        }
-
-        private static string SafeSaveCreatedTime()
-        {
-            try { return SaveRestore.SaveCreatedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture); }
-            catch { return null; }
-        }
-
-        private static string SafeRustProtocol()
-        {
-            try { return Rust.Protocol.printable; }
-            catch { return null; }
         }
 
         private static string WeaponName(HitInfo info)
@@ -2687,15 +3561,13 @@ namespace Oxide.Plugins
         private static string BodyPart(HitInfo info)
         {
             if (info == null) return "unknown";
-            try { return info.boneArea.ToString(); }
-            catch { return "unknown"; }
+            return info.boneArea.ToString();
         }
 
         private static string MajorityDamage(HitInfo info)
         {
             if (info?.damageTypes == null) return "Unknown";
-            try { return info.damageTypes.GetMajorityDamageType().ToString(); }
-            catch { return "Unknown"; }
+            return info.damageTypes.GetMajorityDamageType().ToString();
         }
 
         private static bool IsEnvironmentDamage(Rust.DamageType type)
@@ -2808,10 +3680,12 @@ namespace Oxide.Plugins
             if (_woundedHits.Count == 0) return;
 
             float now = UnityEngine.Time.realtimeSinceStartup;
-            var stale = _woundedHits
-                .Where(entry => now - entry.Value.RecordedAt > WoundRecordTtlSeconds)
-                .Select(entry => entry.Key)
-                .ToList();
+            var stale = new List<string>();
+            foreach (var entry in _woundedHits)
+            {
+                if (now - entry.Value.RecordedAt > WoundRecordTtlSeconds)
+                    stale.Add(entry.Key);
+            }
 
             foreach (var key in stale) _woundedHits.Remove(key);
         }
@@ -2842,8 +3716,7 @@ namespace Oxide.Plugins
             int space = rest.IndexOf(' ');
             if (space > 0)
             {
-                int channel;
-                if (int.TryParse(rest.Substring(0, space), out channel) && channel >= 0 && channel <= 2)
+                if (int.TryParse(rest.Substring(0, space), out int channel) && channel >= 0 && channel <= 2)
                     rest = rest.Substring(space + 1).Trim().Trim('"').Trim();
             }
 
@@ -2860,62 +3733,79 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            return IsMuted(player.UserIDString, out reason, out timeRemaining);
+            return TryGetActiveMute(player.UserIDString, out reason, out timeRemaining);
         }
 
-        private bool IsMuted(string steamId, out string reason, out string timeRemaining)
+        private bool IsMuted(string steamId) =>
+            TryGetActiveMute(steamId, out _, out _, formatRemaining: false);
+
+        private bool IsMuted(string steamId, out string reason, out string timeRemaining) =>
+            TryGetActiveMute(steamId, out reason, out timeRemaining);
+
+        private bool TryGetActiveMute(string steamId, out string reason, out string timeRemaining, bool formatRemaining = true)
         {
             reason = null;
             timeRemaining = null;
 
-            if (string.IsNullOrEmpty(steamId) || _mutes?.ActiveMutes == null) return false;
-
             MuteInfo mute;
-            if (!_mutes.ActiveMutes.TryGetValue(steamId, out mute)) return false;
-
-            var expires = ParseExpiry(mute.ExpiresAt);
-            if (expires != null && DateTimeOffset.UtcNow > expires.Value)
-            {
-                ClearMute(steamId, true);
-                return false;
-            }
+            if (!TryGetActiveMuteInfo(steamId, out mute)) return false;
 
             reason = mute.Reason ?? "Violation";
-            timeRemaining = FormatTimeRemaining(expires);
+            if (formatRemaining)
+                timeRemaining = FormatTimeRemaining(mute.ExpiresAtParsed ?? ParseExpiry(mute.ExpiresAt));
             return true;
         }
 
-        private void ApplyMute(string steamId, string reason, string expiresAt, string playerName)
+        private bool TryGetActiveMuteInfo(string steamId, out MuteInfo mute)
         {
-            _mutes.ActiveMutes[steamId] = new MuteInfo { Reason = reason, ExpiresAt = expiresAt };
+            mute = null;
+            if (string.IsNullOrEmpty(steamId) || _mutes?.ActiveMutes == null) return false;
+            if (!_mutes.ActiveMutes.TryGetValue(steamId, out mute) || mute == null) return false;
+
+            var expires = mute.ExpiresAtParsed ?? ParseExpiry(mute.ExpiresAt);
+            if (mute.ExpiresAtParsed == null) mute.ExpiresAtParsed = expires;
+            if (expires != null && DateTimeOffset.UtcNow > expires.Value)
+            {
+                ClearMute(steamId, true);
+                mute = null;
+                return false;
+            }
+            return true;
+        }
+
+        private void ApplyMute(string steamId, string reason, string expiresAt, string playerName, bool notify = true)
+        {
+            if (_mutes?.ActiveMutes == null) return;
+
+            _mutes.ActiveMutes[steamId] = new MuteInfo
+            {
+                Reason = reason,
+                ExpiresAt = expiresAt,
+                ExpiresAtParsed = ParseExpiry(expiresAt)
+            };
             SaveMutes();
 
-            string timeLeft = FormatTimeRemaining(ParseExpiry(expiresAt));
+            var player = FindConnectedPlayer(steamId);
+            if (player == null) return;
 
-            ulong uid;
-            if (ulong.TryParse(steamId, out uid))
-            {
-                var player = BasePlayer.FindByID(uid);
-                if (player != null && player.IsConnected)
-                {
-                    player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
-                    string notice = Message("Mute.Applied", player, reason, timeLeft);
-                    SendToast(player, notice);
-                    player.ChatMessage(notice);
-                }
-            }
+            player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
+            if (!notify) return;
+
+            string timeLeft = FormatTimeRemaining(ParseExpiry(expiresAt));
+            string notice = Message("Mute.Applied", player, reason, timeLeft);
+            SendToast(player, notice);
+            player.ChatMessage(notice);
         }
 
         private void ClearMute(string steamId, bool silent)
         {
+            if (_mutes?.ActiveMutes == null) return;
+
             bool removed = _mutes.ActiveMutes.Remove(steamId);
             if (removed) SaveMutes();
 
-            ulong uid;
-            if (!ulong.TryParse(steamId, out uid)) return;
-
-            var player = BasePlayer.FindByID(uid);
-            if (player == null || !player.IsConnected) return;
+            var player = FindConnectedPlayer(steamId);
+            if (player == null) return;
 
             player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, false);
             if (silent || !removed) return;
@@ -2929,14 +3819,13 @@ namespace Oxide.Plugins
         {
             if (_mutes?.ActiveMutes == null || _mutes.ActiveMutes.Count == 0) return 0;
 
-            var expired = _mutes.ActiveMutes
-                .Where(entry =>
-                {
-                    var expires = ParseExpiry(entry.Value.ExpiresAt);
-                    return expires != null && DateTimeOffset.UtcNow > expires.Value;
-                })
-                .Select(entry => entry.Key)
-                .ToList();
+            var expired = new List<string>();
+            foreach (var entry in _mutes.ActiveMutes)
+            {
+                var expires = entry.Value?.ExpiresAtParsed ?? ParseExpiry(entry.Value?.ExpiresAt);
+                if (expires != null && DateTimeOffset.UtcNow > expires.Value)
+                    expired.Add(entry.Key);
+            }
 
             foreach (var steamId in expired) ClearMute(steamId, true);
             return expired.Count;
@@ -2946,18 +3835,21 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrWhiteSpace(expiresAt)) return null;
 
-            long unixValue;
-            if (long.TryParse(expiresAt, out unixValue))
+            // RustCore timestamps are UTC naive parse as UTC, not local server time
+            if (long.TryParse(expiresAt, NumberStyles.Integer, CultureInfo.InvariantCulture, out long unixValue))
             {
                 return unixValue > 32503680000L
                     ? DateTimeOffset.FromUnixTimeMilliseconds(unixValue)
                     : DateTimeOffset.FromUnixTimeSeconds(unixValue);
             }
 
-            DateTimeOffset parsed;
-            if (DateTimeOffset.TryParse(expiresAt, null, DateTimeStyles.RoundtripKind, out parsed)) return parsed;
+            if (DateTimeOffset.TryParse(
+                    expiresAt,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset parsed))
+                return parsed;
 
-            PrintWarning($"could not parse expiry '{expiresAt}', treating as permanent");
             return null;
         }
 
@@ -3000,7 +3892,7 @@ namespace Oxide.Plugins
             foreach (var player in BasePlayer.activePlayerList)
             {
                 if (player == null || !player.IsConnected) continue;
-                player.SendConsoleCommand("chat.add", channel, _config.PanelAvatarSteamId, message);
+                player.SendConsoleCommand("chat.add", channel, _config.AvatarSteamId, message);
             }
         }
 
