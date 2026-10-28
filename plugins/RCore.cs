@@ -15,7 +15,7 @@ using ConVar;
 
 namespace Oxide.Plugins
 {
-    [Info("RCore", "rustcore.co", "1.4.0")]
+    [Info("RCore", "rustcore.co", "1.4.1")]
     [Description("Connects a Rust server to RustCore.co")]
     public class RCore : RustPlugin
     {
@@ -174,6 +174,9 @@ namespace Oxide.Plugins
         private bool _policyInFlight;
         private int _policyFailures;
 
+        private string _cachedDisplayIp;
+        private bool _publicIpLookupStarted;
+
         private bool IsLinked => _identity != null && !string.IsNullOrEmpty(_identity.ApiKey);
 
         #endregion
@@ -229,6 +232,7 @@ namespace Oxide.Plugins
         {
             RegisterCommands();
             SweepExpiredMutes();
+            BeginPublicIpLookup();
 
             var host = new GameObject("RCore.Engine");
             UnityEngine.Object.DontDestroyOnLoad(host);
@@ -996,7 +1000,7 @@ namespace Oxide.Plugins
                     Code = code,
                     ServerName = ConVar.Server.hostname ?? "Rust Server",
                     Port = ConVar.Server.port,
-                    DisplayIp = (string.IsNullOrWhiteSpace(ConVar.Server.ip) || ConVar.Server.ip == "0.0.0.0" ? null : ConVar.Server.ip),
+                    DisplayIp = Instance.ResolveDisplayIp(),
                     Version = Instance.Version.ToString(),
                     ProtocolVersion = ProtocolVersion,
                     Framework = Framework,
@@ -1592,19 +1596,23 @@ namespace Oxide.Plugins
             if (!TryGetChatBody(text, out body)) return null;
             if (body.StartsWith("/", StringComparison.Ordinal)) return null;
 
+            string steamId = connection.userid.ToString();
             string reason, timeLeft;
-            if (!IsMuted(connection.userid.ToString(), out reason, out timeLeft))
-                return null;
-
-            var player = connection.player as BasePlayer;
-            if (player != null)
+            if (IsMuted(steamId, out reason, out timeLeft))
             {
-                string notice = Message("Mute.Blocked", player, reason, timeLeft);
-                SendToast(player, notice);
-                player.ChatMessage(notice);
+                var mutedPlayer = connection.player as BasePlayer;
+                if (mutedPlayer != null)
+                {
+                    string notice = Message("Mute.Blocked", mutedPlayer, reason, timeLeft);
+                    SendToast(mutedPlayer, notice);
+                    mutedPlayer.ChatMessage(notice);
+                }
+                return false;
             }
 
-            return false;
+            // Capture before IQChat/BetterChat OnPlayerChat (they return false and skip later plugins).
+            EnqueueChatCapture(connection.player as BasePlayer, steamId, body, ChannelFromSayCommand(text));
+            return null;
         }
 
         private object OnUserChat(Oxide.Core.Libraries.Covalence.IPlayer player, string message)
@@ -1627,35 +1635,36 @@ namespace Oxide.Plugins
                 return false;
             }
 
+            // Ingest happens in OnClientCommand — IQChat always returns false from OnPlayerChat.
+            return null;
+        }
+
+        private void EnqueueChatCapture(BasePlayer player, string steamId, string message, string channelName)
+        {
             var chat = _engine?.Chat;
-            if (chat == null) return null;
+            if (chat == null || string.IsNullOrWhiteSpace(message)) return;
 
-            string channelName = "GLOBAL";
             string teamId = null;
-
-            switch (channel)
-            {
-                case ConVar.Chat.ChatChannel.Team:
-                    channelName = "TEAM";
-                    if (player.currentTeam != 0) teamId = player.currentTeam.ToString();
-                    break;
-                case ConVar.Chat.ChatChannel.Local:
-                    channelName = "LOCAL";
-                    break;
-            }
+            if (channelName == "TEAM" && player != null && player.currentTeam != 0)
+                teamId = player.currentTeam.ToString();
 
             chat.Enqueue(new ChatItemDto
             {
                 EventId = NewEventId(),
-                SteamId = player.UserIDString,
-                Name = player.displayName ?? "Unknown",
+                SteamId = steamId,
+                Name = player != null ? (player.displayName ?? "Unknown") : "Unknown",
                 Message = message,
                 Channel = channelName,
                 TeamId = teamId,
                 CreatedAt = UtcNow()
             });
+        }
 
-            return null;
+        private static string ChannelFromSayCommand(string text)
+        {
+            if (text.StartsWith("chat.teamsay", StringComparison.OrdinalIgnoreCase)) return "TEAM";
+            if (text.StartsWith("chat.localsay", StringComparison.OrdinalIgnoreCase)) return "LOCAL";
+            return "GLOBAL";
         }
 
         private object OnPlayerVoice(BasePlayer player, byte[] data)
@@ -1798,8 +1807,7 @@ namespace Oxide.Plugins
             if (task == null || string.IsNullOrEmpty(task.SteamId))
                 return TaskResult.Fail("NO_TARGET", "steamId missing");
 
-            var expiry = ParseExpiry(task.ExpiresAt);
-            if (expiry != null && DateTimeOffset.UtcNow >= expiry.Value)
+            if (!TryResolvePunishmentExpiry(task.DurationSeconds, task.ExpiresAt, out _, out string announceDuration))
                 return TaskResult.Fail("ALREADY_EXPIRED", "ban expiry is in the past");
 
             string reason = string.IsNullOrEmpty(task.Reason) ? "Banned" : task.Reason;
@@ -1824,7 +1832,7 @@ namespace Oxide.Plugins
                 AnnouncePublic(
                     "Ban.Announced",
                     DisplayName(task.PlayerName, task.SteamId),
-                    FormatAnnounceDuration(task.ExpiresAt),
+                    announceDuration,
                     reason);
             }
 
@@ -1855,20 +1863,21 @@ namespace Oxide.Plugins
             if (task == null || string.IsNullOrEmpty(task.SteamId))
                 return TaskResult.Fail("NO_TARGET", "steamId missing");
 
-            var expiry = ParseExpiry(task.ExpiresAt);
-            if (expiry != null && DateTimeOffset.UtcNow >= expiry.Value)
+            string muteExpiresAt;
+            string announceDuration;
+            if (!TryResolvePunishmentExpiry(task.DurationSeconds, task.ExpiresAt, out muteExpiresAt, out announceDuration))
                 return TaskResult.Fail("ALREADY_EXPIRED", "mute expiry is in the past");
 
             string reason = string.IsNullOrEmpty(task.Reason) ? "Rule Violation" : task.Reason;
             bool alreadyMuted = IsMuted(task.SteamId);
-            ApplyMute(task.SteamId, reason, task.ExpiresAt, task.PlayerName, notify: !alreadyMuted);
+            ApplyMute(task.SteamId, reason, muteExpiresAt, task.PlayerName, notify: !alreadyMuted);
 
             if (task.Announce && !alreadyMuted)
             {
                 AnnouncePublic(
                     "Mute.Announced",
                     DisplayName(task.PlayerName, task.SteamId),
-                    FormatAnnounceDuration(task.ExpiresAt),
+                    announceDuration,
                     reason);
             }
 
@@ -2847,7 +2856,7 @@ namespace Oxide.Plugins
                 Seed = (uint)ConVar.Server.seed,
                 WorldSize = (uint)ConVar.Server.worldsize,
                 Port = ConVar.Server.port,
-                DisplayIp = (string.IsNullOrWhiteSpace(ConVar.Server.ip) || ConVar.Server.ip == "0.0.0.0" ? null : ConVar.Server.ip),
+                DisplayIp = ResolveDisplayIp(),
                 UptimeSeconds = (long)UnityEngine.Time.realtimeSinceStartup,
                 MemoryUsedMb = (long)Performance.current.memoryUsageSystem,
                 QueuedCount = queue?.queue?.Count ?? 0,
@@ -3375,6 +3384,7 @@ namespace Oxide.Plugins
             [JsonProperty("playerName")] public string PlayerName { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
             [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
+            [JsonProperty("durationSeconds")] public int? DurationSeconds { get; set; }
             [JsonProperty("banIp")] public bool BanIp { get; set; }
             [JsonProperty("ip")] public string Ip { get; set; }
             [JsonProperty("announce")] public bool Announce { get; set; }
@@ -3386,6 +3396,7 @@ namespace Oxide.Plugins
             [JsonProperty("playerName")] public string PlayerName { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
             [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
+            [JsonProperty("durationSeconds")] public int? DurationSeconds { get; set; }
             [JsonProperty("announce")] public bool Announce { get; set; }
         }
 
@@ -3869,6 +3880,118 @@ namespace Oxide.Plugins
             var expiry = ParseExpiry(expiresAt);
             if (expiry == null) return "permanently";
             return "for " + FormatTimeRemaining(expiry);
+        }
+
+        // Prefer durationSeconds (exact length from apply)
+        private bool TryResolvePunishmentExpiry(
+            int? durationSeconds,
+            string expiresAt,
+            out string resolvedExpiresAt,
+            out string announceDuration)
+        {
+            if (durationSeconds != null && durationSeconds.Value > 0)
+            {
+                var expiry = DateTimeOffset.UtcNow.AddSeconds(durationSeconds.Value);
+                resolvedExpiresAt = expiry.ToString("o", CultureInfo.InvariantCulture);
+                announceDuration = "for " + FormatTimeSpan(TimeSpan.FromSeconds(durationSeconds.Value));
+                return true;
+            }
+
+            var panelExpiry = ParseExpiry(expiresAt);
+            if (panelExpiry != null && DateTimeOffset.UtcNow >= panelExpiry.Value)
+            {
+                resolvedExpiresAt = expiresAt;
+                announceDuration = null;
+                return false;
+            }
+
+            resolvedExpiresAt = expiresAt;
+            announceDuration = FormatAnnounceDuration(expiresAt);
+            return true;
+        }
+
+        private static string FormatTimeSpan(TimeSpan remaining)
+        {
+            if (remaining.TotalSeconds <= 0) return "0s";
+            if (remaining.TotalDays >= 1) return $"{(int)remaining.TotalDays}d {remaining.Hours}h";
+            if (remaining.TotalHours >= 1) return $"{(int)remaining.TotalHours}h {remaining.Minutes}m";
+            return $"{remaining.Minutes}m {remaining.Seconds}s";
+        }
+
+        private string ResolveDisplayIp()
+        {
+            if (IsPublicIpv4(_cachedDisplayIp))
+                return _cachedDisplayIp;
+
+            if (IsPublicIpv4(ConVar.Server.ip))
+            {
+                _cachedDisplayIp = ConVar.Server.ip.Trim();
+                return _cachedDisplayIp;
+            }
+
+            try
+            {
+                var steamIp = Steamworks.SteamServer.PublicIp;
+                if (steamIp != null)
+                {
+                    string steam = steamIp.ToString();
+                    if (IsPublicIpv4(steam))
+                    {
+                        _cachedDisplayIp = steam;
+                        return _cachedDisplayIp;
+                    }
+                }
+            }
+            catch
+            {
+                // Steam may not be ready yet
+            }
+
+            BeginPublicIpLookup();
+            return IsPublicIpv4(_cachedDisplayIp) ? _cachedDisplayIp : null;
+        }
+
+        private void BeginPublicIpLookup()
+        {
+            if (_publicIpLookupStarted) return;
+            _publicIpLookupStarted = true;
+
+            webrequest.Enqueue(
+                "https://api.ipify.org",
+                null,
+                (code, response) =>
+                {
+                    if (Instance == null) return;
+                    if (code != 200 || string.IsNullOrWhiteSpace(response)) return;
+                    string ip = response.Trim();
+                    if (!IsPublicIpv4(ip)) return;
+                    Instance._cachedDisplayIp = ip;
+                },
+                this,
+                RequestMethod.GET);
+        }
+
+        private static bool IsPublicIpv4(string ip)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return false;
+            ip = ip.Trim();
+            if (ip == "0.0.0.0") return false;
+
+            string[] parts = ip.Split('.');
+            if (parts.Length != 4) return false;
+
+            int a, b, c, d;
+            if (!int.TryParse(parts[0], out a) || !int.TryParse(parts[1], out b)
+                || !int.TryParse(parts[2], out c) || !int.TryParse(parts[3], out d))
+                return false;
+            if (a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255)
+                return false;
+
+            if (a == 10 || a == 127) return false;
+            if (a == 192 && b == 168) return false;
+            if (a == 172 && b >= 16 && b <= 31) return false;
+            if (a == 169 && b == 254) return false;
+            return true;
         }
 
         private static string DisplayName(string playerName, string steamId)
