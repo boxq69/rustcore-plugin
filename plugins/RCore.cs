@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Reflection;
 using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -15,7 +17,7 @@ using ConVar;
 
 namespace Oxide.Plugins
 {
-    [Info("RCore", "rustcore.co", "1.4.1")]
+    [Info("RCore", "rustcore.co", "1.5.0")]
     [Description("Connects a Rust server to RustCore.co")]
     public class RCore : RustPlugin
     {
@@ -70,14 +72,22 @@ namespace Oxide.Plugins
                 ["Unban.Announced"] = "<color=#55ff55>{0}</color> is no longer banned.",
                 ["Kick.Default"] = "Kicked by an administrator",
                 ["Autokick.Default"] = "You are not allowed on this server.",
-                ["Autokick.Unavailable"] = "Unable to verify access right now. Please try again shortly."
+                ["Autokick.Unavailable"] = "Unable to verify access right now. Please try again shortly.",
+                ["Runtime.Unavailable"] = "This feature is unavailable right now. Please try again later.",
+                ["Runtime.Cooldown"] = "Please wait {0}s before using this command again."
             }, this);
         }
 
         private string Message(string key, BasePlayer player, params object[] args)
         {
             string template = lang.GetMessage(key, this, player?.UserIDString);
-            return args.Length == 0 ? template : string.Format(template, args);
+            if (args.Length == 0) return template;
+            try { return string.Format(template, args); }
+            catch (FormatException)
+            {
+                WarnThrottled("lang", $"message '{key}' has an invalid format string");
+                return template;
+            }
         }
         
         #endregion
@@ -104,20 +114,48 @@ namespace Oxide.Plugins
         private const string KillsPath = "/api/ingest/deaths";
         private const string WipePath = "/api/ingest/wipe";
         private const string AutokickCheckPath = "/api/ingest/autokick-check";
+        private const string MapPath = "/api/ingest/map";
+        private const string PositionsPath = "/api/ingest/positions";
+        private const string DrawingsPath = "/api/ingest/drawings";
+        private const string DrawingsGonePath = "/api/ingest/drawings/gone";
+        private const string DrawingsReconcilePath = "/api/ingest/drawings/reconcile";
+        private const string NamedContentPath = "/api/ingest/named-content";
+        private const string NamedContentGonePath = "/api/ingest/named-content/gone";
+        private const string AudioPath = "/api/ingest/audio";
+        private const string AudioGonePath = "/api/ingest/audio/gone";
+        private const string AudioReconcilePath = "/api/ingest/audio/reconcile";
+        private const string CommandPath = "/api/ingest/command";
+        private const string EventsPath = "/api/ingest/events";
 
         private const string IdentityFileName = "RCore/identity";
         private const string MuteFileName = "RCore/mutes";
         private const string SpoolFileName = "RCore/spool";
         private const string TaskFileName = "RCore/tasks";
+        private const string FingerprintFileName = "RCore/content";
+        private const int MaxDrawingBytes = 4 * 1024 * 1024;
+        private const int MaxAudioBytes = 2 * 1024 * 1024;
+        private const int MaxReconcileNetIds = 20000;
+        private const float FrameBudgetSeconds = 0.003f;
+        private const float WarnInterval = 300f;
+        private const float SpoolWriteDelay = 5f;
 
         private const ulong SteamIdBase = 76561197960265728UL;
         private const float RequestTimeoutSeconds = 10f;
         private const float IdleHeartbeatSeconds = 15f;
         private const float FullSyncIntervalSeconds = 30f;
+        private const float MapPositionsInterval = 4f;
+        private const float MapCheckInterval = 20f;
+        private const int MapChunkBytes = 512 * 1024;
+        private const float MapRequestTimeoutSeconds = 120f;
+        private const int MapOceanMarginPx = 500;
+        private const float MapRenderTargetPx = 2048f;
         private const float QueuePollInterval = 5f;
         private const float ChatFlushInterval = 3f;
         private const float ReportsFlushInterval = 5f;
         private const float CombatFlushInterval = 10f;
+        private const float CombatLogGapSeconds = 20f;
+        private const float CombatLogDepthSeconds = 30f;
+        private const int MaxCombatLogEntries = 500;
         private const int MaxBufferItems = 5000;
         private const int MaxBatchItems = 50;
         private const int MaxDisconnectsPerHeartbeat = 200;
@@ -129,10 +167,9 @@ namespace Oxide.Plugins
         private const float SpoolWriteInterval = 60f;
         private const float LinkVerifyInterval = 30f;
         private const float MuteSweepInterval = 30f;
-        private const float LoginSyncDebounce = 5f;
         private const float FullSyncDebounce = 5f;
         private const float TaskSaveInterval = 5f;
-        private const int MaxProcessedTasks = 20000;
+        private const int MaxProcessedTasks = 5000;
         private const float PolicyFlushInterval = 1.5f;
         private const float AutokickCacheTtl = 45f;
         private const int MaxAutokickCacheEntries = 1024;
@@ -161,8 +198,6 @@ namespace Oxide.Plugins
         private bool _commandsRegistered;
         private bool _pendingWipe;
         private bool _tasksDirty;
-        private float _lastLoginSync = -999f;
-        private float _lastFullSyncRequest = -999f;
 
         private readonly Dictionary<string, HitRecord> _woundedHits = new Dictionary<string, HitRecord>();
         private readonly Dictionary<ulong, float> _voiceToastCooldowns = new Dictionary<ulong, float>();
@@ -176,6 +211,12 @@ namespace Oxide.Plugins
 
         private string _cachedDisplayIp;
         private bool _publicIpLookupStarted;
+
+        private readonly ContentIndex _content = new ContentIndex();
+        private readonly Dictionary<int, bool> _cassetteItemIds = new Dictionary<int, bool>();
+        private ContentFingerprintStore _fingerprints;
+        private bool _fingerprintsDirty;
+        private int _fingerprintScopeFrame = -1;
 
         private bool IsLinked => _identity != null && !string.IsNullOrEmpty(_identity.ApiKey);
 
@@ -253,6 +294,7 @@ namespace Oxide.Plugins
             }
 
             SaveProcessedTasks();
+            SaveFingerprintsIfDirty();
             _woundedHits.Clear();
             _voiceToastCooldowns.Clear();
             _afkTrackers.Clear();
@@ -267,7 +309,6 @@ namespace Oxide.Plugins
         private void RegisterCommands()
         {
             if (_commandsRegistered) return;
-            // some consoles only see global.rcore.*
             cmd.AddConsoleCommand("rcore.pair", this, nameof(CmdPair));
             cmd.AddConsoleCommand("global.rcore.pair", this, nameof(CmdPair));
             cmd.AddConsoleCommand("rcore.unpair", this, nameof(CmdUnpair));
@@ -332,28 +373,48 @@ namespace Oxide.Plugins
                 };
             }
 
+            // Flags are set directly: BetterChat shadows the mute/unmute commands.
+            var online = new Dictionary<string, BasePlayer>(BasePlayer.activePlayerList.Count, StringComparer.Ordinal);
+            for (int i = 0; i < BasePlayer.activePlayerList.Count; i++)
+            {
+                var p = BasePlayer.activePlayerList[i];
+                if (p != null && p.IsConnected) online[p.UserIDString] = p;
+            }
+
+            bool changed = false;
             var toClear = new List<string>();
             foreach (var key in _mutes.ActiveMutes.Keys)
             {
                 if (!desired.ContainsKey(key)) toClear.Add(key);
             }
             for (int i = 0; i < toClear.Count; i++)
-                ClearMute(toClear[i], true);
+            {
+                _mutes.ActiveMutes.Remove(toClear[i]);
+                changed = true;
+                BasePlayer player;
+                if (online.TryGetValue(toClear[i], out player))
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, false);
+            }
 
             foreach (var pair in desired)
             {
                 MuteInfo existing;
-                if (_mutes.ActiveMutes.TryGetValue(pair.Key, out existing)
+                bool same = _mutes.ActiveMutes.TryGetValue(pair.Key, out existing)
                     && existing != null
                     && string.Equals(existing.Reason, pair.Value.Reason, StringComparison.Ordinal)
-                    && string.Equals(existing.ExpiresAt ?? "", pair.Value.ExpiresAt ?? "", StringComparison.Ordinal))
+                    && string.Equals(existing.ExpiresAt ?? "", pair.Value.ExpiresAt ?? "", StringComparison.Ordinal);
+                if (!same)
                 {
-                    EnforceChatMuteFlag(pair.Key, true);
-                    continue;
+                    _mutes.ActiveMutes[pair.Key] = pair.Value;
+                    changed = true;
                 }
 
-                ApplyMute(pair.Key, pair.Value.Reason, pair.Value.ExpiresAt, null, notify: false);
+                BasePlayer player;
+                if (online.TryGetValue(pair.Key, out player) && !player.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute))
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
             }
+
+            if (changed) SaveMutes();
         }
 
         // FindByID sometimes misses connected players
@@ -371,14 +432,6 @@ namespace Oxide.Plugins
                 if (p != null && p.userID == uid && p.IsConnected) return p;
             }
             return null;
-        }
-
-        // don't call mute/unmute cmds - BetterChat shadows them
-        private static void EnforceChatMuteFlag(string steamId, bool muted)
-        {
-            var player = FindConnectedPlayer(steamId);
-            if (player == null) return;
-            player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, muted);
         }
 
         private void LoadProcessedTasks()
@@ -472,15 +525,23 @@ namespace Oxide.Plugins
             public ChatWorker Chat;
             public ReportWorker Reports;
             public CombatWorker Combat;
+            public MapWorker Map;
+            public PositionsWorker Positions;
+            public DrawingsWorker Drawings;
+            public NamedContentWorker NamedContent;
+            public AudioWorker Audio;
+            public RuntimeWorker Runtime;
 
             private GameObject _session;
             private SpoolStore _spool = new SpoolStore();
             private bool _spoolDirty;
+            private readonly HashSet<string>[] _spoolIds = new HashSet<string>[SpoolKindCount];
 
             private void Awake()
             {
                 Current = this;
                 LoadSpool();
+                if (Instance != null) StartCoroutine(Instance._content.Seed());
 
                 Http = gameObject.AddComponent<HttpPump>();
                 Link = gameObject.AddComponent<LinkWorker>();
@@ -503,6 +564,7 @@ namespace Oxide.Plugins
             {
                 RecoverSpool();
                 WriteSpool();
+                Instance?.SaveFingerprintsIfDirty();
             }
 
             private void TickTaskSave()
@@ -516,6 +578,7 @@ namespace Oxide.Plugins
                 CloseSession();
                 WriteSpool(true);
                 Instance?.FlushProcessedTasksIfDirty(force: true);
+                Instance?.SaveFingerprintsIfDirty();
                 if (Current == this) Current = null;
             }
 
@@ -532,8 +595,17 @@ namespace Oxide.Plugins
                 Chat = _session.AddComponent<ChatWorker>();
                 Reports = _session.AddComponent<ReportWorker>();
                 Combat = _session.AddComponent<CombatWorker>();
+                Map = _session.AddComponent<MapWorker>();
+                Positions = _session.AddComponent<PositionsWorker>();
+                Drawings = _session.AddComponent<DrawingsWorker>();
+                NamedContent = _session.AddComponent<NamedContentWorker>();
+                Audio = _session.AddComponent<AudioWorker>();
+                Runtime = _session.AddComponent<RuntimeWorker>();
 
                 State.RequestSync(0.5f);
+                Drawings.RequestFullSync(8f);
+                NamedContent.RequestFullSync(10f);
+                Audio.RequestFullSync(12f);
             }
 
             private void CloseSession()
@@ -543,7 +615,8 @@ namespace Oxide.Plugins
                 var session = _session;
                 _session = null;
                 State = null; Queue = null; Chat = null;
-                Reports = null; Combat = null;
+                Reports = null; Combat = null; Map = null; Positions = null; Drawings = null;
+                NamedContent = null; Audio = null; Runtime = null;
 
                 UnityEngine.Object.DestroyImmediate(session);
                 WriteSpool(true);
@@ -551,14 +624,7 @@ namespace Oxide.Plugins
 
             public void HandleTasks(List<QueueTaskDto> tasks) => Queue?.Dispatch(tasks);
 
-            public void RequestFullSync(float delay)
-            {
-                if (State == null || Instance == null) return;
-                float now = UnityEngine.Time.realtimeSinceStartup;
-                if (now - Instance._lastFullSyncRequest < FullSyncDebounce) return;
-                Instance._lastFullSyncRequest = now;
-                State.RequestSync(delay);
-            }
+            public void RequestFullSync(float delay) => State?.RequestSync(delay);
 
             public void RecordDisconnect(string steamId, string reason) => State?.EnqueueDisconnect(steamId, reason);
 
@@ -583,37 +649,70 @@ namespace Oxide.Plugins
             public void SpoolItems<T>(SpoolKind kind, T item)
             {
                 if (item == null) return;
-                var bucket = Bucket(kind);
-                var inFlight = InFlightBucket(kind);
-                var token = JToken.FromObject(item);
-                var eventId = SpoolEventId(token);
-                if (eventId != null && SpoolContainsEvent(inFlight, eventId)) return;
-                if (eventId != null && SpoolContainsEvent(bucket, eventId)) return;
-                bucket.Add(token);
-                if (bucket.Count > MaxBufferItems)
-                    bucket.RemoveRange(0, bucket.Count - MaxBufferItems);
-                _spoolDirty = true;
+                if (AddToSpool(kind, JToken.FromObject(item))) TrimSpool(kind);
             }
 
             public void SpoolItems<T>(SpoolKind kind, List<T> items)
             {
                 if (items == null || items.Count == 0) return;
-                var bucket = Bucket(kind);
-                var inFlight = InFlightBucket(kind);
+                bool added = false;
                 foreach (var item in items)
                 {
                     if (item == null) continue;
-                    var token = JToken.FromObject(item);
-                    var eventId = SpoolEventId(token);
-                    if (eventId != null && SpoolContainsEvent(inFlight, eventId))
-                        continue;
-                    if (eventId != null && SpoolContainsEvent(bucket, eventId))
-                        continue;
-                    bucket.Add(token);
+                    added |= AddToSpool(kind, JToken.FromObject(item));
                 }
-                if (bucket.Count > MaxBufferItems)
-                    bucket.RemoveRange(0, bucket.Count - MaxBufferItems);
+                if (added) TrimSpool(kind);
+            }
+
+            private bool AddToSpool(SpoolKind kind, JToken token)
+            {
+                string eventId = SpoolEventId(token);
+                if (eventId != null && !SpoolIds(kind).Add(eventId)) return false;
+                Bucket(kind).Add(token);
                 _spoolDirty = true;
+                return true;
+            }
+
+            private void TrimSpool(SpoolKind kind)
+            {
+                var bucket = Bucket(kind);
+                int excess = bucket.Count - MaxBufferItems;
+                if (excess <= 0) return;
+                ForgetSpoolIds(kind, bucket, excess);
+                bucket.RemoveRange(0, excess);
+                _spoolDirty = true;
+            }
+
+            private HashSet<string> SpoolIds(SpoolKind kind)
+            {
+                var ids = _spoolIds[(int)kind];
+                if (ids != null) return ids;
+
+                ids = new HashSet<string>(StringComparer.Ordinal);
+                AddSpoolIds(ids, InFlightBucket(kind));
+                AddSpoolIds(ids, Bucket(kind));
+                _spoolIds[(int)kind] = ids;
+                return ids;
+            }
+
+            private static void AddSpoolIds(HashSet<string> ids, List<JToken> bucket)
+            {
+                for (int i = 0; i < bucket.Count; i++)
+                {
+                    string id = SpoolEventId(bucket[i]);
+                    if (id != null) ids.Add(id);
+                }
+            }
+
+            private void ForgetSpoolIds(SpoolKind kind, List<JToken> bucket, int count)
+            {
+                var ids = _spoolIds[(int)kind];
+                if (ids == null) return;
+                for (int i = 0; i < count && i < bucket.Count; i++)
+                {
+                    string id = SpoolEventId(bucket[i]);
+                    if (id != null) ids.Remove(id);
+                }
             }
 
             private List<T> Claim<T>(SpoolKind kind, int max)
@@ -622,7 +721,7 @@ namespace Oxide.Plugins
                 var inFlight = InFlightBucket(kind);
 
                 if (inFlight.Count > 0)
-                    return DeserializeSpool<T>(inFlight, inFlight.Count);
+                    return DeserializeSpool<T>(kind, inFlight);
 
                 int count = Math.Min(pending.Count, max);
                 if (count <= 0) return new List<T>();
@@ -630,10 +729,9 @@ namespace Oxide.Plugins
                 for (int i = 0; i < count; i++)
                     inFlight.Add(pending[i]);
                 pending.RemoveRange(0, count);
-                _spoolDirty = true;
-                WriteSpool(true);
+                ScheduleSpoolWrite();
 
-                return DeserializeSpool<T>(inFlight, inFlight.Count);
+                return DeserializeSpool<T>(kind, inFlight);
             }
 
             public void CommitSpool(SpoolKind kind, int sentCount)
@@ -642,9 +740,9 @@ namespace Oxide.Plugins
                 var inFlight = InFlightBucket(kind);
                 int n = Math.Min(sentCount, inFlight.Count);
                 if (n <= 0) return;
+                ForgetSpoolIds(kind, inFlight, n);
                 inFlight.RemoveRange(0, n);
-                _spoolDirty = true;
-                WriteSpool(true);
+                ScheduleSpoolWrite();
             }
 
             public void ReturnClaimed(SpoolKind kind)
@@ -654,21 +752,53 @@ namespace Oxide.Plugins
                 if (inFlight.Count == 0) return;
                 pending.InsertRange(0, inFlight);
                 inFlight.Clear();
-                if (pending.Count > MaxBufferItems)
-                    pending.RemoveRange(0, pending.Count - MaxBufferItems);
-                _spoolDirty = true;
-                WriteSpool(true);
+                TrimSpool(kind);
+                ScheduleSpoolWrite();
             }
 
-            private static List<T> DeserializeSpool<T>(List<JToken> source, int count)
+            private void ScheduleSpoolWrite()
             {
-                var result = new List<T>(count);
-                for (int i = 0; i < count && i < source.Count; i++)
+                _spoolDirty = true;
+                if (!IsInvoking(nameof(FlushSpool))) Invoke(nameof(FlushSpool), SpoolWriteDelay);
+            }
+
+            private void FlushSpool() => WriteSpool();
+
+            private List<T> DeserializeSpool<T>(SpoolKind kind, List<JToken> source)
+            {
+                var result = new List<T>(source.Count);
+                int i = 0;
+                while (i < source.Count)
                 {
-                    try { result.Add(source[i].ToObject<T>()); }
-                    catch { }
+                    T value;
+                    if (TryReadSpoolItem(source[i], out value))
+                    {
+                        result.Add(value);
+                        i++;
+                        continue;
+                    }
+
+                    string id = SpoolEventId(source[i]);
+                    if (id != null) _spoolIds[(int)kind]?.Remove(id);
+                    source.RemoveAt(i);
+                    _spoolDirty = true;
                 }
                 return result;
+            }
+
+            private static bool TryReadSpoolItem<T>(JToken token, out T value)
+            {
+                try
+                {
+                    value = token.ToObject<T>();
+                    return value != null;
+                }
+                catch (JsonException ex)
+                {
+                    WarnThrottled("spool", $"dropping an unreadable {typeof(T).Name}: {ex.Message}");
+                    value = default(T);
+                    return false;
+                }
             }
 
             private static string SpoolEventId(JToken token)
@@ -676,17 +806,6 @@ namespace Oxide.Plugins
                 if (token == null || token.Type != JTokenType.Object) return null;
                 var id = token["eventId"];
                 return id != null && id.Type == JTokenType.String ? (string)id : null;
-            }
-
-            private static bool SpoolContainsEvent(List<JToken> bucket, string eventId)
-            {
-                if (string.IsNullOrEmpty(eventId) || bucket == null) return false;
-                for (int i = 0; i < bucket.Count; i++)
-                {
-                    if (string.Equals(SpoolEventId(bucket[i]), eventId, StringComparison.Ordinal))
-                        return true;
-                }
-                return false;
             }
 
             public void RecoverSpool()
@@ -807,8 +926,16 @@ namespace Oxide.Plugins
                 string body = null;
                 if (payload != null)
                 {
-                    try { body = JsonConvert.SerializeObject(payload, Formatting.None); }
-                    catch { return; }
+                    try
+                    {
+                        body = JsonConvert.SerializeObject(payload, Formatting.None);
+                    }
+                    catch (JsonException ex)
+                    {
+                        WarnThrottled("send", $"{path}: payload not serializable: {ex.Message}");
+                        onError?.Invoke(0, null);
+                        return;
+                    }
                 }
 
                 if (_inFlight == 0) _inFlightSince = UnityEngine.Time.realtimeSinceStartup;
@@ -848,8 +975,14 @@ namespace Oxide.Plugins
                         T parsed = null;
                         if (!string.IsNullOrEmpty(response))
                         {
-                            try { parsed = JsonConvert.DeserializeObject<T>(response); }
-                            catch { parsed = null; }
+                            try
+                            {
+                                parsed = JsonConvert.DeserializeObject<T>(response);
+                            }
+                            catch (JsonException ex)
+                            {
+                                WarnThrottled("send", $"{path}: unreadable response: {ex.Message}");
+                            }
                         }
 
                         onSuccess?.Invoke(parsed);
@@ -1022,8 +1155,14 @@ namespace Oxide.Plugins
                     }
 
                     PairResponse parsed = null;
-                    try { parsed = JsonConvert.DeserializeObject<PairResponse>(response ?? ""); }
-                    catch { parsed = null; }
+                    try
+                    {
+                        parsed = JsonConvert.DeserializeObject<PairResponse>(response ?? "");
+                    }
+                    catch (JsonException ex)
+                    {
+                        WarnThrottled("pair", $"unreadable pair response: {ex.Message}");
+                    }
 
                     var data = parsed?.Data;
                     if (data == null || string.IsNullOrEmpty(data.ApiKey))
@@ -1112,6 +1251,8 @@ namespace Oxide.Plugins
                 Instance.SaveIdentity();
 
                 _fatalStreak = 0;
+                // unlink only, reload keeps groups
+                Engine?.Runtime?.ResetForUnlink();
                 OnUnlinked?.Invoke();
                 Interface.CallHook("RCore_OnUnlinked", reason);
             }
@@ -1126,6 +1267,7 @@ namespace Oxide.Plugins
             private List<DisconnectDto> _disconnectsInFlight;
             private List<TeamChangeDto> _teamChangesInFlight;
             private float _lastFullSync = -999f;
+            private float _scheduledSyncAt = -1f;
             private bool _forceFullSync = true;
 
             protected override float Interval => IdleHeartbeatSeconds;
@@ -1196,8 +1338,26 @@ namespace Oxide.Plugins
             public void RequestSync(float delay)
             {
                 _forceFullSync = true;
-                CancelInvoke(nameof(SyncNow));
-                Invoke(nameof(SyncNow), Mathf.Max(0.1f, delay));
+
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                float at = Mathf.Max(now + Mathf.Max(0.1f, delay), _lastFullSync + FullSyncDebounce);
+                if (_scheduledSyncAt > 0f && _scheduledSyncAt <= at) return;
+
+                _scheduledSyncAt = at;
+                CancelInvoke(nameof(ScheduledSync));
+                Invoke(nameof(ScheduledSync), at - now);
+            }
+
+            private void ScheduledSync()
+            {
+                _scheduledSyncAt = -1f;
+                if (!_forceFullSync) return;
+                if (!Ready)
+                {
+                    RequestSync(1f);
+                    return;
+                }
+                SyncNow();
             }
 
             protected override void Tick() => SyncNow();
@@ -1222,7 +1382,8 @@ namespace Oxide.Plugins
                     Entities = fullSync ? BaseNetworkable.serverEntities.Count : 0,
                     Players = fullSync ? Instance.SnapshotPlayers() : null,
                     Server = fullSync ? Instance.SnapshotServer() : null,
-                    Teams = fullSync ? Instance.SnapshotTeams() : null
+                    Teams = fullSync ? Instance.SnapshotTeams() : null,
+                    Runtime = fullSync ? Engine?.Runtime?.Capability() : null
                 };
 
                 _alertsInFlight = Alerts.Take(MaxBatchItems);
@@ -1250,6 +1411,13 @@ namespace Oxide.Plugins
                             Instance?.ReconcileMutes(response.Mutes);
                         if (response?.Tasks != null && response.Tasks.Count > 0)
                             Engine?.HandleTasks(response.Tasks);
+                        if (response != null && response.MapNeeded)
+                            Engine?.Map?.RequestDeliver();
+                        // missing = keep what we have
+                        if (response?.Manifest != null)
+                            Engine?.Runtime?.ApplyFromBackend(response.Manifest, response.ManifestVersion);
+                        if (response?.Groups != null)
+                            Engine?.Runtime?.ReconcileGroups(response.Groups);
                     },
                     (code, body) =>
                     {
@@ -1309,6 +1477,2298 @@ namespace Oxide.Plugins
                 Instance?.PruneWoundRecords();
                 base.Tick();
             }
+        }
+
+        private class PositionsWorker : RCoreWorker
+        {
+            protected override float Interval => MapPositionsInterval;
+
+            protected override void Tick()
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+
+                var players = new List<object>(BasePlayer.activePlayerList.Count);
+                foreach (var player in BasePlayer.activePlayerList)
+                {
+                    if (player == null || !player.IsConnected) continue;
+                    var pos = player.transform.position;
+                    var eyes = player.eyes;
+                    float yaw = eyes != null ? eyes.rotation.eulerAngles.y : player.transform.eulerAngles.y;
+                    players.Add(new
+                    {
+                        steamId = player.UserIDString,
+                        x = pos.x,
+                        y = pos.y,
+                        z = pos.z,
+                        yaw
+                    });
+                }
+
+                Send<object>(PositionsPath, new
+                {
+                    serverId = Instance._identity.ServerId,
+                    timestamp = UtcNow(),
+                    players
+                }, _ => { });
+            }
+        }
+
+        private class MapWorker : RCoreWorker
+        {
+            private string _deliveredIdentity;
+            private bool _inFlight;
+            private bool _force;
+            private int _imageWidth;
+            private int _imageHeight;
+            private float _padFraction = MapOceanMarginPx / MapRenderTargetPx;
+            private string _contentType = "image/png";
+
+            protected override float Interval => MapCheckInterval;
+
+            public void RequestDeliver()
+            {
+                _force = true;
+                if (!_inFlight) Tick();
+            }
+
+            protected override void Tick()
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                if (_inFlight) return;
+
+                string identity = BuildIdentityKey();
+                if (!_force && string.Equals(_deliveredIdentity, identity, StringComparison.Ordinal))
+                    return;
+
+                _force = false;
+                DeliverMap(identity);
+            }
+
+            private static string BuildIdentityKey()
+            {
+                string save = SaveCreatedTimeKey();
+                return string.Join("|",
+                    ConVar.Server.level ?? "",
+                    ConVar.Server.seed.ToString(CultureInfo.InvariantCulture),
+                    ConVar.Server.worldsize.ToString(CultureInfo.InvariantCulture),
+                    save);
+            }
+
+            private static string TryOfficialMapUrl()
+            {
+                string url = MapUploader.ImageUrl;
+                if (string.IsNullOrWhiteSpace(url)) return null;
+                url = url.Trim();
+                if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                    return null;
+                return url;
+            }
+
+            private void DeliverMap(string identity)
+            {
+                string officialUrl = TryOfficialMapUrl();
+                if (officialUrl != null)
+                {
+                    _inFlight = true;
+                    StartCoroutine(FetchOfficialThenUpload(identity, officialUrl));
+                    return;
+                }
+
+                DeliverRenderedFallback(identity);
+            }
+
+            private IEnumerator FetchOfficialThenUpload(string identity, string url)
+            {
+                byte[] bytes = null;
+                string contentType = null;
+                using (var req = UnityWebRequest.Get(url))
+                {
+                    req.timeout = Mathf.Max(1, (int)MapRequestTimeoutSeconds);
+                    yield return req.SendWebRequest();
+
+                    bool ok = req.result == UnityWebRequest.Result.Success
+                              && req.responseCode >= 200 && req.responseCode < 300
+                              && req.downloadHandler != null
+                              && req.downloadHandler.data != null
+                              && req.downloadHandler.data.Length > 0;
+                    if (!ok)
+                    {
+                        _inFlight = false;
+                        DeliverRenderedFallback(identity);
+                        yield break;
+                    }
+
+                    bytes = req.downloadHandler.data;
+                    contentType = req.GetResponseHeader("Content-Type");
+                }
+
+                if (bytes == null || bytes.Length == 0)
+                {
+                    _inFlight = false;
+                    DeliverRenderedFallback(identity);
+                    yield break;
+                }
+
+                BeginUpload(identity, bytes, contentType);
+            }
+
+            private void DeliverRenderedFallback(string identity)
+            {
+                float worldSize = Mathf.Max(1f, ConVar.Server.worldsize);
+                float scale = Mathf.Clamp(MapRenderTargetPx / worldSize, 0.1f, 4f);
+
+                byte[] bytes;
+                int width;
+                int height;
+                try
+                {
+                    Color background;
+                    bytes = MapImageRenderer.Render(out width, out height, out background, scale, false);
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("map", $"MapImageRenderer failed: {ex.Message}");
+                    return;
+                }
+
+                if (bytes == null || bytes.Length == 0 || width <= 0 || height <= 0)
+                    return;
+
+                _imageWidth = width;
+                _imageHeight = height;
+                BeginUpload(identity, bytes, "image/png");
+            }
+
+            private static float PadFractionForWidth(int width)
+            {
+                if (width <= 0) width = (int)MapRenderTargetPx;
+                return Mathf.Clamp(MapOceanMarginPx / (float)width, 0f, 0.45f);
+            }
+
+            private void BeginUpload(string identity, byte[] bytes, string contentType)
+            {
+                _contentType = NormalizeImageContentType(contentType, bytes);
+                int parsedW;
+                int parsedH;
+                if (TryReadImageSize(bytes, out parsedW, out parsedH))
+                {
+                    _imageWidth = parsedW;
+                    _imageHeight = parsedH;
+                }
+                else
+                {
+                    if (_imageWidth <= 0) _imageWidth = (int)MapRenderTargetPx;
+                    if (_imageHeight <= 0) _imageHeight = (int)MapRenderTargetPx;
+                }
+
+                _padFraction = PadFractionForWidth(_imageWidth);
+
+                string hash = Sha256Hex(bytes);
+                string uploadId = Guid.NewGuid().ToString("N");
+                int chunkCount = Math.Max(1, (bytes.Length + MapChunkBytes - 1) / MapChunkBytes);
+                _inFlight = true;
+                UploadChunk(identity, uploadId, hash, bytes, 0, chunkCount);
+            }
+
+            private static string NormalizeImageContentType(string header, byte[] bytes)
+            {
+                if (!string.IsNullOrWhiteSpace(header))
+                {
+                    string ct = header.Split(';')[0].Trim().ToLowerInvariant();
+                    if (ct == "image/png" || ct == "image/jpeg" || ct == "image/jpg" || ct == "image/webp")
+                        return ct == "image/jpg" ? "image/jpeg" : ct;
+                }
+
+                if (bytes != null && bytes.Length >= 8
+                    && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47)
+                    return "image/png";
+                if (bytes != null && bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+                    return "image/jpeg";
+                if (bytes != null && bytes.Length >= 12
+                    && bytes[0] == (byte)'R' && bytes[1] == (byte)'I' && bytes[2] == (byte)'F' && bytes[3] == (byte)'F'
+                    && bytes[8] == (byte)'W' && bytes[9] == (byte)'E' && bytes[10] == (byte)'B' && bytes[11] == (byte)'P')
+                    return "image/webp";
+                return "image/png";
+            }
+
+            private static bool TryReadImageSize(byte[] bytes, out int width, out int height)
+            {
+                width = 0;
+                height = 0;
+                if (bytes == null || bytes.Length < 24) return false;
+
+                if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47)
+                {
+                    width = (bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19];
+                    height = (bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23];
+                    return width > 0 && height > 0;
+                }
+
+                // JPEG: scan SOF0/SOF2 for height/width.
+                if (bytes[0] == 0xFF && bytes[1] == 0xD8)
+                {
+                    int i = 2;
+                    while (i + 8 < bytes.Length)
+                    {
+                        if (bytes[i] != 0xFF) { i++; continue; }
+                        byte marker = bytes[i + 1];
+                        if (marker == 0xD9 || marker == 0xDA) break;
+                        int segLen = (bytes[i + 2] << 8) | bytes[i + 3];
+                        if (segLen < 2) break;
+                        if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7)
+                            || (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF))
+                        {
+                            height = (bytes[i + 5] << 8) | bytes[i + 6];
+                            width = (bytes[i + 7] << 8) | bytes[i + 8];
+                            return width > 0 && height > 0;
+                        }
+                        i += 2 + segLen;
+                    }
+                }
+
+                return false;
+            }
+
+            private void UploadChunk(string identity, string uploadId, string hash, byte[] bytes, int index, int chunkCount)
+            {
+                int offset = index * MapChunkBytes;
+                int len = Math.Min(MapChunkBytes, bytes.Length - offset);
+                byte[] slice = new byte[len];
+                Buffer.BlockCopy(bytes, offset, slice, 0, len);
+
+                var headers = Instance.BuildHeaders(true);
+                headers["Content-Type"] = "application/octet-stream";
+                headers["X-Map-Upload-Id"] = uploadId;
+                headers["X-Map-Identity-Key"] = identity;
+                headers["X-Map-Chunk-Index"] = index.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Chunk-Count"] = chunkCount.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Byte-Length"] = bytes.Length.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Content-Hash"] = hash;
+                headers["X-Map-Level"] = ConVar.Server.level ?? "";
+                headers["X-Map-Seed"] = ConVar.Server.seed.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-World-Size"] = ConVar.Server.worldsize.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Save-Created-Time"] = SaveCreatedTimeKey();
+                headers["X-Map-Image-Width"] = _imageWidth.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Image-Height"] = _imageHeight.ToString(CultureInfo.InvariantCulture);
+                headers["X-Map-Pad-Fraction"] = _padFraction.ToString("G", CultureInfo.InvariantCulture);
+                headers["X-Map-Content-Type"] = _contentType ?? "image/png";
+
+                var pump = Engine?.Http;
+                if (pump == null)
+                {
+                    _inFlight = false;
+                    return;
+                }
+
+                pump.Enqueue(
+                    Instance.BuildUrl(MapPath),
+                    UnityWebRequest.kHttpVerbPOST,
+                    headers,
+                    null,
+                    (code, body) =>
+                    {
+                        if (code < 200 || code >= 300)
+                        {
+                            _inFlight = false;
+                            return;
+                        }
+                        if (index + 1 < chunkCount)
+                        {
+                            UploadChunk(identity, uploadId, hash, bytes, index + 1, chunkCount);
+                            return;
+                        }
+                        _inFlight = false;
+                        _deliveredIdentity = identity;
+                    },
+                    HttpLane.Bulk,
+                    slice,
+                    (int)MapRequestTimeoutSeconds);
+            }
+        }
+
+        private enum ContentKind { None, Paintable, Named, Cassette }
+
+        private sealed class EntityReferenceComparer : IEqualityComparer<BaseEntity>
+        {
+            public static readonly EntityReferenceComparer Shared = new EntityReferenceComparer();
+            public bool Equals(BaseEntity a, BaseEntity b) => ReferenceEquals(a, b);
+            public int GetHashCode(BaseEntity entity) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(entity);
+        }
+
+        private class ContentIndex
+        {
+            private const int SeedBatch = 20000;
+            private static readonly Dictionary<uint, bool> CassettePrefabs = new Dictionary<uint, bool>();
+
+            public readonly HashSet<BaseEntity> Paintables = new HashSet<BaseEntity>(EntityReferenceComparer.Shared);
+            public readonly HashSet<BaseEntity> Sculptures = new HashSet<BaseEntity>(EntityReferenceComparer.Shared);
+            public readonly HashSet<BaseEntity> Named = new HashSet<BaseEntity>(EntityReferenceComparer.Shared);
+            public readonly HashSet<BaseEntity> Cassettes = new HashSet<BaseEntity>(EntityReferenceComparer.Shared);
+
+            private bool _seeding;
+
+            public bool Ready { get; private set; }
+
+            public static ContentKind Classify(BaseEntity entity)
+            {
+                if (entity is Signage
+                    || entity is PhotoFrame
+                    || entity is CarvablePumpkin
+                    || entity is BaseSculpture
+                    || entity is PatternFirework
+                    || entity is PaintedItemStorageEntity
+                    || entity is ISignage)
+                    return ContentKind.Paintable;
+                if (entity is VendingMachine || entity is SleepingBag) return ContentKind.Named;
+                if (IsCassette(entity)) return ContentKind.Cassette;
+                return ContentKind.None;
+            }
+
+            /// <summary>Cached per prefab, so the hot spawn hook never builds strings.</summary>
+            public static bool IsCassette(BaseEntity entity)
+            {
+                if (entity == null) return false;
+                uint prefabId = entity.prefabID;
+                bool result;
+                if (prefabId != 0 && CassettePrefabs.TryGetValue(prefabId, out result)) return result;
+
+                result = entity.GetType().Name.IndexOf("Cassette", StringComparison.OrdinalIgnoreCase) >= 0
+                         || (entity.ShortPrefabName ?? "").IndexOf("cassette", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (prefabId != 0) CassettePrefabs[prefabId] = result;
+                return result;
+            }
+
+            public void Add(BaseNetworkable networkable)
+            {
+                var entity = networkable as BaseEntity;
+                if (entity == null || entity.IsDestroyed || entity.net == null) return;
+
+                switch (Classify(entity))
+                {
+                    case ContentKind.Paintable:
+                        Paintables.Add(entity);
+                        if (entity is BaseSculpture) Sculptures.Add(entity);
+                        break;
+                    case ContentKind.Named:
+                        Named.Add(entity);
+                        break;
+                    case ContentKind.Cassette:
+                        Cassettes.Add(entity);
+                        break;
+                }
+            }
+
+            public ContentKind Remove(BaseNetworkable networkable)
+            {
+                var entity = networkable as BaseEntity;
+                if (ReferenceEquals(entity, null)) return ContentKind.None;
+
+                if (Paintables.Remove(entity))
+                {
+                    Sculptures.Remove(entity);
+                    return ContentKind.Paintable;
+                }
+                if (Named.Remove(entity)) return ContentKind.Named;
+                if (Cassettes.Remove(entity)) return ContentKind.Cassette;
+
+                // Before the seed pass finishes an entity may not be indexed yet.
+                return Ready ? ContentKind.None : Classify(entity);
+            }
+
+            public IEnumerator Seed()
+            {
+                if (_seeding || Ready) yield break;
+                _seeding = true;
+
+                var snapshot = new List<BaseNetworkable>(BaseNetworkable.serverEntities.Count);
+                foreach (var networkable in BaseNetworkable.serverEntities) snapshot.Add(networkable);
+
+                for (int i = 0; i < snapshot.Count; i++)
+                {
+                    Add(snapshot[i]);
+                    if ((i + 1) % SeedBatch == 0) yield return null;
+                }
+
+                _seeding = false;
+                Ready = true;
+            }
+
+            /// <summary>Live members of <paramref name="set"/>; prunes entities destroyed without a kill hook.</summary>
+            public List<BaseEntity> Live(HashSet<BaseEntity> set)
+            {
+                var live = new List<BaseEntity>(set.Count);
+                List<BaseEntity> dead = null;
+                foreach (var entity in set)
+                {
+                    if (entity == null || entity.IsDestroyed || entity.net == null)
+                    {
+                        if (dead == null) dead = new List<BaseEntity>();
+                        dead.Add(entity);
+                        continue;
+                    }
+                    live.Add(entity);
+                }
+
+                if (dead != null)
+                {
+                    for (int i = 0; i < dead.Count; i++)
+                    {
+                        set.Remove(dead[i]);
+                        if (set == Paintables) Sculptures.Remove(dead[i]);
+                    }
+                }
+                return live;
+            }
+
+            public static List<string> NetIds(List<BaseEntity> entities)
+            {
+                var ids = new List<string>(entities.Count);
+                for (int i = 0; i < entities.Count; i++) ids.Add(NetIdOf(entities[i]));
+                return ids;
+            }
+        }
+
+        /// <summary>
+        /// Last value uploaded per content key, persisted so a restart does not re-upload every
+        /// sign, bag and cassette. Scoped to server + wipe; a new scope starts empty.
+        /// </summary>
+        private class ContentFingerprintStore
+        {
+            public string Scope;
+            public Dictionary<string, string> Entries = new Dictionary<string, string>();
+        }
+
+        private Dictionary<string, string> Fingerprints()
+        {
+            if (_fingerprints == null)
+            {
+                _fingerprints = TryLoad<ContentFingerprintStore>(FingerprintFileName, "content fingerprints");
+                if (_fingerprints.Entries == null) _fingerprints.Entries = new Dictionary<string, string>();
+                _fingerprintScopeFrame = -1;
+            }
+
+            int frame = UnityEngine.Time.frameCount;
+            if (frame != _fingerprintScopeFrame)
+            {
+                _fingerprintScopeFrame = frame;
+                string scope = (_identity?.ServerId ?? "") + "#" + WipeIdentityKey();
+                if (!string.Equals(_fingerprints.Scope, scope, StringComparison.Ordinal))
+                {
+                    _fingerprints.Scope = scope;
+                    _fingerprints.Entries.Clear();
+                    _fingerprintsDirty = true;
+                }
+            }
+            return _fingerprints.Entries;
+        }
+
+        private bool HasFingerprint(string key, string value)
+        {
+            string stored;
+            return key != null && Fingerprints().TryGetValue(key, out stored) && string.Equals(stored, value, StringComparison.Ordinal);
+        }
+
+        private void RememberFingerprint(string key, string value)
+        {
+            if (key == null || value == null) return;
+            Fingerprints()[key] = value;
+            _fingerprintsDirty = true;
+        }
+
+        private void ForgetFingerprint(string key)
+        {
+            if (key != null && Fingerprints().Remove(key)) _fingerprintsDirty = true;
+        }
+
+        private void SaveFingerprintsIfDirty()
+        {
+            if (!_fingerprintsDirty || _fingerprints == null) return;
+            if (TrySave(FingerprintFileName, _fingerprints, "content fingerprints")) _fingerprintsDirty = false;
+        }
+
+        /// <summary>
+        /// Rust renames private members between builds, so a few reads go through reflection.
+        /// Lookups are cached per runtime type; a cached null means this build has no such member.
+        /// </summary>
+        private static class Members
+        {
+            private const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            private const BindingFlags DeclaredFlags = Flags | BindingFlags.DeclaredOnly;
+
+            private static readonly string[] CassetteAudioNames = { "audioId", "AudioId", "_audioId", "oggId", "OggId" };
+            private static readonly string[] CassetteLengthNames = { "MaxCassetteLength", "maxCassetteLength" };
+            private static readonly string[] SculptureResetNames = { "ResetToDefault", "ResetSculpture", "ClearSculpture", "LoadDefault", "Reset" };
+            private static readonly string[] PaintedImageNames = { "_currentImageCrc", "currentImageCrc", "imageCrc", "_imageCrc" };
+
+            private static readonly Dictionary<Type, MemberInfo> SculptureCrcMembers = new Dictionary<Type, MemberInfo>();
+            private static readonly Dictionary<Type, MemberInfo> CassetteAudioMembers = new Dictionary<Type, MemberInfo>();
+            private static readonly Dictionary<Type, MemberInfo> CassetteLengthMembers = new Dictionary<Type, MemberInfo>();
+            private static readonly Dictionary<Type, MethodInfo> SculptureResetMethods = new Dictionary<Type, MethodInfo>();
+
+            private static bool _pumpkinResolved;
+            private static FieldInfo _pumpkinTextureIds;
+            private static bool _photoResolved;
+            private static FieldInfo _photoOverlayCrc;
+            private static bool _storageResolved;
+            private static object _oggType;
+            private static MethodInfo _typedGet;
+            private static MethodInfo _typedRemove;
+            private static MethodInfo _crcRemove;
+            private static bool _paintedResolved;
+            private static MemberInfo _paintedImageCrc;
+            private static MethodInfo _paintedClearContent;
+            private static object _pngType;
+            private static MethodInfo _pngRemoveExact;
+            private static MethodInfo _pngRemove;
+
+            public static uint SculptureCrcOf(BaseEntity entity) =>
+                ReadUInt(entity, Cached(SculptureCrcMembers, entity.GetType(), FindCrcMember));
+
+            public static uint CassetteAudioIdOf(BaseEntity entity) =>
+                ReadUInt(entity, Cached(CassetteAudioMembers, entity.GetType(), t => FindNamed(t, CassetteAudioNames, IsIdType)));
+
+            public static void ClearCassetteAudioId(BaseEntity entity) =>
+                WriteZero(entity, Cached(CassetteAudioMembers, entity.GetType(), t => FindNamed(t, CassetteAudioNames, IsIdType)));
+
+            public static float CassetteLengthOf(BaseEntity entity)
+            {
+                var member = Cached(CassetteLengthMembers, entity.GetType(),
+                    t => FindNamed(t, CassetteLengthNames, ft => ft == typeof(float)));
+                object value = Read(entity, member);
+                return value is float f ? f : 0f;
+            }
+
+            public static uint[] PumpkinTextureIds(CarvablePumpkin pumpkin)
+            {
+                if (!_pumpkinResolved)
+                {
+                    _pumpkinResolved = true;
+                    var field = typeof(CarvablePumpkin).GetField("textureIDs", Flags);
+                    _pumpkinTextureIds = field != null && field.FieldType == typeof(uint[]) ? field : null;
+                }
+                return Read(pumpkin, _pumpkinTextureIds) as uint[];
+            }
+
+            public static void ClearPhotoOverlay(PhotoFrame frame)
+            {
+                if (!_photoResolved)
+                {
+                    _photoResolved = true;
+                    var field = typeof(PhotoFrame).GetField("_overlayTextureCrc", Flags);
+                    _photoOverlayCrc = field != null && IsIdType(field.FieldType) ? field : null;
+                }
+                WriteZero(frame, _photoOverlayCrc);
+            }
+
+            public static bool ResetSculpture(BaseSculpture sculpture)
+            {
+                var type = sculpture.GetType();
+                MethodInfo method;
+                if (!SculptureResetMethods.TryGetValue(type, out method))
+                {
+                    method = null;
+                    foreach (var name in SculptureResetNames)
+                    {
+                        method = type.GetMethod(name, Flags, null, Type.EmptyTypes, null);
+                        if (method != null) break;
+                    }
+                    SculptureResetMethods[type] = method;
+                }
+                if (method == null) return false;
+
+                try
+                {
+                    method.Invoke(sculpture, null);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("sculpture", $"{type.Name}.{method.Name} failed: {ex.GetBaseException().Message}");
+                    return false;
+                }
+            }
+
+            /// <summary>
+            /// Wipe the image of a painted inventory item and drop its png from FileStorage.
+            /// Prefers the game's own ClearContent (the F7 UGC browser path); otherwise zeroes the CRC.
+            /// Returns false when this build exposes neither, so the task is not reported as done.
+            /// </summary>
+            public static bool ClearPaintedImage(PaintedItemStorageEntity painted)
+            {
+                ResolvePainted();
+                if (_paintedClearContent == null && _paintedImageCrc == null) return false;
+
+                uint crc = ReadUInt(painted, _paintedImageCrc);
+                if (_paintedClearContent != null)
+                {
+                    try
+                    {
+                        _paintedClearContent.Invoke(painted, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        WarnThrottled("painted", $"ClearContent failed: {ex.GetBaseException().Message}");
+                        if (_paintedImageCrc == null) return false;
+                        WriteZero(painted, _paintedImageCrc);
+                    }
+                }
+                else
+                {
+                    WriteZero(painted, _paintedImageCrc);
+                }
+
+                if (crc != 0 && painted.net != null) RemovePngBlob(crc, painted.net.ID);
+                return true;
+            }
+
+            private static void ResolvePainted()
+            {
+                if (_paintedResolved) return;
+                _paintedResolved = true;
+
+                var type = typeof(PaintedItemStorageEntity);
+                _paintedImageCrc = FindNamed(type, PaintedImageNames, IsIdType) ?? FindCrcMember(type);
+                _paintedClearContent = type.GetMethod("ClearContent", Flags, null, Type.EmptyTypes, null);
+
+                var enumType = typeof(FileStorage).GetNestedType("Type");
+                if (enumType == null || !enumType.IsEnum) return;
+                foreach (var name in Enum.GetNames(enumType))
+                {
+                    if (!string.Equals(name, "png", StringComparison.OrdinalIgnoreCase)) continue;
+                    _pngType = Enum.Parse(enumType, name);
+                    break;
+                }
+                if (_pngType == null) return;
+
+                _pngRemoveExact = typeof(FileStorage).GetMethod("RemoveExact",
+                    new[] { typeof(uint), enumType, typeof(NetworkableId), typeof(uint) });
+                _pngRemove = typeof(FileStorage).GetMethod("Remove",
+                    new[] { typeof(uint), enumType, typeof(NetworkableId) });
+            }
+
+            private static void RemovePngBlob(uint crc, NetworkableId netId)
+            {
+                try
+                {
+                    if (_pngRemoveExact != null)
+                        _pngRemoveExact.Invoke(FileStorage.server, new object[] { crc, _pngType, netId, 0u });
+                    else if (_pngRemove != null)
+                        _pngRemove.Invoke(FileStorage.server, new object[] { crc, _pngType, netId });
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("painted", $"FileStorage remove failed for {netId.Value}: {ex.GetBaseException().Message}");
+                }
+            }
+
+            /// <summary>Older builds only expose the typed Get(uint crc, FileStorage.Type, NetworkableId).</summary>
+            public static byte[] TypedAudioGet(uint crc, NetworkableId netId)
+            {
+                ResolveStorage();
+                if (_typedGet == null) return null;
+                try
+                {
+                    return _typedGet.Invoke(FileStorage.server, new object[] { crc, _oggType, netId }) as byte[];
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("audio", $"FileStorage typed read failed for {netId.Value}: {ex.GetBaseException().Message}");
+                    return null;
+                }
+            }
+
+            public static void RemoveAudioBlob(uint crc, NetworkableId netId)
+            {
+                ResolveStorage();
+                try
+                {
+                    if (_typedRemove != null)
+                        _typedRemove.Invoke(FileStorage.server, new object[] { crc, _oggType, netId });
+                    else if (_crcRemove != null)
+                        _crcRemove.Invoke(FileStorage.server, new object[] { crc });
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("audio", $"FileStorage remove failed for {netId.Value}: {ex.GetBaseException().Message}");
+                }
+            }
+
+            private static void ResolveStorage()
+            {
+                if (_storageResolved) return;
+                _storageResolved = true;
+
+                var enumType = typeof(FileStorage).GetNestedType("Type");
+                if (enumType != null && enumType.IsEnum)
+                {
+                    foreach (var name in Enum.GetNames(enumType))
+                    {
+                        if (string.Equals(name, "ogg", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(name, "audio", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _oggType = Enum.Parse(enumType, name);
+                            break;
+                        }
+                    }
+                }
+
+                if (_oggType != null)
+                {
+                    var signature = new[] { typeof(uint), _oggType.GetType(), typeof(NetworkableId) };
+                    _typedGet = typeof(FileStorage).GetMethod("Get", signature);
+                    _typedRemove = typeof(FileStorage).GetMethod("Remove", signature);
+                }
+                _crcRemove = typeof(FileStorage).GetMethod("Remove", new[] { typeof(uint) });
+            }
+
+            private static MemberInfo Cached(Dictionary<Type, MemberInfo> cache, Type type, Func<Type, MemberInfo> find)
+            {
+                MemberInfo member;
+                if (!cache.TryGetValue(type, out member))
+                {
+                    member = find(type);
+                    cache[type] = member;
+                }
+                return member;
+            }
+
+            private static bool IsIdType(Type type) => type == typeof(uint) || type == typeof(ulong);
+
+            private static bool IsReadable(PropertyInfo property) =>
+                property.CanRead && property.GetIndexParameters().Length == 0;
+
+            private static MemberInfo FindCrcMember(Type type)
+            {
+                for (var t = type; t != null && t != typeof(BaseEntity) && t != typeof(object); t = t.BaseType)
+                {
+                    foreach (var property in t.GetProperties(DeclaredFlags))
+                    {
+                        if (IsIdType(property.PropertyType) && IsReadable(property)
+                            && property.Name.IndexOf("crc", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return property;
+                    }
+                    foreach (var field in t.GetFields(DeclaredFlags))
+                    {
+                        if (IsIdType(field.FieldType)
+                            && field.Name.IndexOf("crc", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return field;
+                    }
+                }
+                return null;
+            }
+
+            private static MemberInfo FindNamed(Type type, string[] names, Func<Type, bool> valueType)
+            {
+                for (var t = type; t != null && t != typeof(BaseEntity) && t != typeof(object); t = t.BaseType)
+                {
+                    foreach (var name in names)
+                    {
+                        var field = t.GetField(name, DeclaredFlags);
+                        if (field != null && valueType(field.FieldType)) return field;
+                        var property = t.GetProperty(name, DeclaredFlags);
+                        if (property != null && valueType(property.PropertyType) && IsReadable(property)) return property;
+                    }
+                }
+                return null;
+            }
+
+            private static object Read(object target, MemberInfo member)
+            {
+                if (member == null || target == null) return null;
+                try
+                {
+                    var field = member as FieldInfo;
+                    return field != null ? field.GetValue(target) : ((PropertyInfo)member).GetValue(target, null);
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("reflection", $"{member.DeclaringType?.Name}.{member.Name}: {ex.GetBaseException().Message}");
+                    return null;
+                }
+            }
+
+            private static uint ReadUInt(object target, MemberInfo member)
+            {
+                object value = Read(target, member);
+                if (value is uint u) return u;
+                if (value is ulong ul) return (uint)ul;
+                return 0;
+            }
+
+            private static void WriteZero(object target, MemberInfo member)
+            {
+                if (member == null || target == null) return;
+                var field = member as FieldInfo;
+                var property = member as PropertyInfo;
+                Type type = field != null ? field.FieldType : property.PropertyType;
+                object zero = type == typeof(ulong) ? (object)0UL : 0u;
+                try
+                {
+                    if (field != null)
+                    {
+                        if (!field.IsInitOnly) field.SetValue(target, zero);
+                    }
+                    else if (property.CanWrite)
+                    {
+                        property.SetValue(target, zero, null);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("reflection", $"{member.DeclaringType?.Name}.{member.Name}: {ex.GetBaseException().Message}");
+                }
+            }
+        }
+
+        private static string NetIdOf(BaseNetworkable entity) =>
+            entity.net.ID.Value.ToString(CultureInfo.InvariantCulture);
+
+        private static string OwnerIdOf(BaseEntity entity) =>
+            entity.OwnerID != 0UL ? entity.OwnerID.ToString(CultureInfo.InvariantCulture) : "";
+
+        private static Vector3 PositionOf(BaseEntity entity) =>
+            entity.transform != null ? entity.transform.position : Vector3.zero;
+
+        private static string Sha256Hex(byte[] data)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "").ToLowerInvariant();
+        }
+
+        internal static string WipeIdentityKey()
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}|{1}|{2}|{3}",
+                ConVar.Server.level ?? "",
+                ConVar.Server.seed,
+                ConVar.Server.worldsize,
+                SaveCreatedTimeKey());
+        }
+
+        /// <summary>
+        /// Facepunch / panel map convention: north (+Z) = low number, 0-based (A0 at NW).
+        /// Must match the grid overlay in web map-camera.ts.
+        /// </summary>
+        private static string GridLabel(Vector3 position)
+        {
+            float worldSize = Mathf.Max(1f, ConVar.Server.worldsize);
+            int count = Math.Max(1, (int)Math.Floor(worldSize * 7.0 / 1024.0));
+            float cell = worldSize / count;
+            float half = worldSize * 0.5f;
+            int col = Mathf.Clamp((int)Math.Floor((position.x + half) / cell), 0, count - 1);
+            int rowFromSouth = Mathf.Clamp((int)Math.Floor((position.z + half) / cell), 0, count - 1);
+            int rowFromNorth = count - 1 - rowFromSouth;
+            return GridLetter(col + 1) + rowFromNorth.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string GridLetter(int n)
+        {
+            if (n < 1) return "?";
+            string letters = "";
+            float tens = n / 26f;
+            int ones = n % 26;
+            if (ones == 0) ones = 26;
+            if (tens > 1) letters += (char)(64 + (int)Math.Floor(tens));
+            letters += (char)(64 + ones);
+            return letters;
+        }
+
+        private static string PaintableKind(BaseEntity entity)
+        {
+            if (entity is PhotoFrame) return "photo_frame";
+            if (entity is CarvablePumpkin || entity is BaseSculpture) return "pumpkin";
+            if (entity is PatternFirework) return "firework";
+            if (entity is PaintedItemStorageEntity) return "painted_item";
+
+            string name = entity?.ShortPrefabName ?? entity?.PrefabName ?? "";
+            if (ContainsText(name, "photo") || ContainsText(name, "pictureframe") || ContainsText(name, "picture_frame"))
+                return "photo_frame";
+            if (ContainsText(name, "pumpkin") || ContainsText(name, "sculpture") || ContainsText(name, "carvable"))
+                return "pumpkin";
+            if (ContainsText(name, "neon")) return "neon";
+            return "sign";
+        }
+
+        private static bool ContainsText(string value, string part) =>
+            value.IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private class DrawingsWorker : RCoreWorker
+        {
+            private const int MaxQueuedJobs = 256;
+            private const long MaxQueuedBytes = 32L * 1024 * 1024;
+            private const int MaxGoneBatch = 500;
+            private const int MaxUploadAttempts = 3;
+            private const float UploadSpacing = 0.75f;
+            private const float RetryPause = 15f;
+            private const float SculptureRescanInterval = 20f;
+            private const float ReconcileInterval = 300f;
+
+            private readonly Queue<DrawingUploadJob> _queue = new Queue<DrawingUploadJob>();
+            private readonly Dictionary<string, string> _queuedFingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
+            private readonly List<string> _destroyBuffer = new List<string>(32);
+            private readonly HashSet<string> _destroyPending = new HashSet<string>();
+            private readonly HashSet<string> _pendingCapture = new HashSet<string>();
+            private long _queuedBytes;
+            private bool _uploadInFlight;
+            private float _nextUploadAt;
+            private bool _goneInFlight;
+            private bool _reconcileInFlight;
+            private bool _syncQueued;
+            private bool _syncRunning;
+            private bool _rescanRunning;
+            private float _syncAt = -1f;
+            private float _nextSculptureRescanAt = -1f;
+            private float _nextReconcileAt = -1f;
+
+            protected override float Interval => 2f;
+
+            /// <summary>Soft cap: full-sync passes wait here so uploads drain first.</summary>
+            private bool QueueBusy => _queue.Count >= MaxQueuedJobs || _queuedBytes >= MaxQueuedBytes;
+
+            public void RequestFullSync(float delay)
+            {
+                _syncQueued = true;
+                _syncAt = UnityEngine.Time.realtimeSinceStartup + Mathf.Max(0.5f, delay);
+            }
+
+            /// <summary>
+            /// FileStorage often gets the new CRC a beat after the paint hook, so read late and
+            /// retry once when the first read is empty.
+            /// </summary>
+            public void ScheduleCapture(BaseEntity entity, string editorSteamId, int textureIndex, string kind)
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null || Instance == null) return;
+                string key = NetIdOf(entity) + ":" + textureIndex.ToString(CultureInfo.InvariantCulture);
+                if (!_pendingCapture.Add(key)) return;
+
+                Instance.timer.Once(0.25f, () => CaptureAttempt(entity, editorSteamId, textureIndex, kind, key, true));
+            }
+
+            private void CaptureAttempt(BaseEntity entity, string editorSteamId, int textureIndex, string kind, string key, bool retry)
+            {
+                bool done = true;
+                try
+                {
+                    if (this == null || entity == null || entity.IsDestroyed || entity.net == null) return;
+                    if (EnqueueEntity(entity, editorSteamId, textureIndex, kind) || !retry || Instance == null) return;
+
+                    done = false;
+                    Instance.timer.Once(0.35f, () => CaptureAttempt(entity, editorSteamId, textureIndex, kind, key, false));
+                }
+                finally
+                {
+                    if (done) _pendingCapture.Remove(key);
+                }
+            }
+
+            public bool EnqueueEntity(BaseEntity entity, string editorSteamId, int textureIndex, string kind)
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null) return false;
+                if (entity is BaseSculpture) return EnqueueSculpture(entity, editorSteamId, force: true);
+
+                uint[] crcs = FaceCrcs(entity);
+                if (crcs == null || crcs.Length == 0) return false;
+                int face = Mathf.Clamp(textureIndex, 0, crcs.Length - 1);
+                return EnqueueFace(entity, editorSteamId, kind, face, crcs[face], force: true);
+            }
+
+            public void EnqueueBytes(BaseEntity entity, string editorSteamId, string kind, byte[] bytes, int textureIndex)
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null) return;
+                if (bytes == null || bytes.Length == 0 || bytes.Length > MaxDrawingBytes) return;
+                string netId = NetIdOf(entity);
+                int face = Math.Max(0, textureIndex);
+                Enqueue(BuildJob(entity, netId, editorSteamId, kind, bytes, face, FaceKey(netId, face), null));
+            }
+
+            public bool EnqueueFirework(PatternFirework firework, ProtoBuf.PatternFirework.Design design, string editorSteamId, bool force)
+            {
+                if (firework == null || firework.IsDestroyed || firework.net == null) return false;
+                string fingerprint = DesignFingerprint(design);
+                if (fingerprint == null) return false;
+
+                string netId = NetIdOf(firework);
+                string key = FaceKey(netId, 0);
+                if (!force && IsKnown(key, fingerprint)) return false;
+
+                byte[] png = RenderFireworkDesignToPng(design);
+                if (png == null) return false;
+                return Enqueue(BuildJob(firework, netId, editorSteamId, "firework", png, 0, key, fingerprint));
+            }
+
+            /// <summary>
+            /// BaseSculpture stores lz4 SDF in FileStorage, not a PNG. The CRC is the fingerprint
+            /// and a generated preview is uploaded so the panel can list and track edits.
+            /// </summary>
+            public bool EnqueueSculpture(BaseEntity entity, string editorSteamId, bool force)
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null || !(entity is BaseSculpture)) return false;
+
+                uint crc = SculptureCrc(entity);
+                string netId = NetIdOf(entity);
+                string key = FaceKey(netId, 0);
+                string fingerprint = crc.ToString(CultureInfo.InvariantCulture);
+                if (!force && IsKnown(key, fingerprint)) return false;
+
+                byte[] png = CaptureSculpturePng(entity, crc);
+                if (png == null) return false;
+                return Enqueue(BuildJob(entity, netId, editorSteamId, "pumpkin", png, 0, key, fingerprint));
+            }
+
+            public void EnqueueDestroy(string netId)
+            {
+                if (string.IsNullOrEmpty(netId)) return;
+                if (!_destroyPending.Add(netId)) return;
+                _destroyBuffer.Add(netId);
+            }
+
+            protected override void Tick()
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+
+                if (_syncQueued && now >= _syncAt && !_syncRunning)
+                {
+                    _syncQueued = false;
+                    StartCoroutine(RunFullSync());
+                }
+
+                if (_nextSculptureRescanAt < 0f) _nextSculptureRescanAt = now + SculptureRescanInterval;
+                if (now >= _nextSculptureRescanAt && !_syncRunning && !_rescanRunning)
+                {
+                    _nextSculptureRescanAt = now + SculptureRescanInterval;
+                    StartCoroutine(RescanSculptures());
+                }
+
+                if (_nextReconcileAt < 0f) _nextReconcileAt = now + ReconcileInterval;
+                if (now >= _nextReconcileAt && !_syncRunning)
+                {
+                    _nextReconcileAt = now + ReconcileInterval;
+                    Reconcile();
+                }
+
+                if (_destroyBuffer.Count > 0 && !_goneInFlight)
+                    FlushDestroy();
+
+                PumpUploads();
+            }
+
+            private IEnumerator RunFullSync()
+            {
+                _syncRunning = true;
+                try
+                {
+                    var wait = new WaitForSeconds(1f);
+                    var index = Instance?._content;
+                    while (index != null && !index.Ready) yield return wait;
+                    if (index == null) yield break;
+
+                    var entities = index.Live(index.Paintables);
+                    float sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                    for (int i = 0; i < entities.Count; i++)
+                    {
+                        while (QueueBusy && Instance != null && Instance.IsLinked) yield return wait;
+                        if (Instance == null || !Instance.IsLinked) yield break;
+
+                        var entity = entities[i];
+                        if (entity != null && !entity.IsDestroyed && entity.net != null)
+                            SyncEntity(entity);
+
+                        if (UnityEngine.Time.realtimeSinceStartup - sliceStart >= FrameBudgetSeconds)
+                        {
+                            yield return null;
+                            sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                        }
+                    }
+
+                    _nextReconcileAt = 0f;
+                }
+                finally
+                {
+                    _syncRunning = false;
+                }
+            }
+
+            private void SyncEntity(BaseEntity entity)
+            {
+                // Painted item bytes only arrive through OnItemPainted.
+                if (entity is PaintedItemStorageEntity) return;
+
+                if (entity is BaseSculpture)
+                {
+                    EnqueueSculpture(entity, null, force: false);
+                    return;
+                }
+
+                var firework = entity as PatternFirework;
+                if (firework != null)
+                {
+                    EnqueueFirework(firework, firework.Design, null, force: false);
+                    return;
+                }
+
+                uint[] crcs = FaceCrcs(entity);
+                if (crcs == null) return;
+                string kind = PaintableKind(entity);
+                for (int face = 0; face < crcs.Length; face++)
+                    EnqueueFace(entity, null, kind, face, crcs[face], force: false);
+            }
+
+            /// <summary>Sculpt edits have no hook, so CRCs are polled.</summary>
+            private IEnumerator RescanSculptures()
+            {
+                _rescanRunning = true;
+                try
+                {
+                    var index = Instance?._content;
+                    if (index == null || !index.Ready) yield break;
+
+                    var sculptures = index.Live(index.Sculptures);
+                    float sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                    for (int i = 0; i < sculptures.Count; i++)
+                    {
+                        if (QueueBusy || Instance == null) yield break;
+                        var entity = sculptures[i];
+                        if (entity != null && !entity.IsDestroyed && entity.net != null)
+                            EnqueueSculpture(entity, null, force: false);
+
+                        if (UnityEngine.Time.realtimeSinceStartup - sliceStart >= FrameBudgetSeconds)
+                        {
+                            yield return null;
+                            sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                        }
+                    }
+                }
+                finally
+                {
+                    _rescanRunning = false;
+                }
+            }
+
+            /// <summary>Marks paintables destroyed without a kill hook as gone.</summary>
+            private void Reconcile()
+            {
+                var index = Instance?._content;
+                if (_reconcileInFlight || index == null || !index.Ready) return;
+
+                var live = ContentIndex.NetIds(index.Live(index.Paintables));
+                if (live.Count > MaxReconcileNetIds)
+                {
+                    WarnThrottled("drawings", $"{live.Count} paintables exceed the reconcile cap of {MaxReconcileNetIds}; skipping reconcile");
+                    return;
+                }
+
+                _reconcileInFlight = true;
+                Send<JObject>(
+                    DrawingsReconcilePath,
+                    new Dictionary<string, object>
+                    {
+                        ["wipeIdentityKey"] = WipeIdentityKey(),
+                        ["liveNetIds"] = live
+                    },
+                    _ => { _reconcileInFlight = false; },
+                    (code, body) => { _reconcileInFlight = false; });
+            }
+
+            private void FlushDestroy()
+            {
+                int take = Math.Min(MaxGoneBatch, _destroyBuffer.Count);
+                var batch = _destroyBuffer.GetRange(0, take);
+                _destroyBuffer.RemoveRange(0, take);
+                for (int i = 0; i < batch.Count; i++) _destroyPending.Remove(batch[i]);
+
+                _goneInFlight = true;
+                Send<JObject>(
+                    DrawingsGonePath,
+                    new Dictionary<string, object> { ["netIds"] = batch },
+                    _ => { _goneInFlight = false; },
+                    (code, body) => { _goneInFlight = false; });
+            }
+
+            private bool EnqueueFace(BaseEntity entity, string editorSteamId, string kind, int face, uint crc, bool force)
+            {
+                if (crc == 0) return false;
+                string netId = NetIdOf(entity);
+                string key = FaceKey(netId, face);
+                string fingerprint = crc.ToString(CultureInfo.InvariantCulture);
+                if (!force && IsKnown(key, fingerprint)) return false;
+
+                byte[] bytes = ReadFace(entity.net.ID, face, crc);
+                if (bytes == null) return false;
+                return Enqueue(BuildJob(entity, netId, editorSteamId, kind, bytes, face, key, fingerprint));
+            }
+
+            private bool IsKnown(string key, string fingerprint)
+            {
+                string queued;
+                if (_queuedFingerprints.TryGetValue(key, out queued) && queued == fingerprint) return true;
+                return Instance != null && Instance.HasFingerprint(key, fingerprint);
+            }
+
+            private bool Enqueue(DrawingUploadJob job)
+            {
+                if (job == null) return false;
+
+                string queued;
+                if (_queuedFingerprints.TryGetValue(job.FingerprintKey, out queued) && queued == job.Fingerprint)
+                    return true;
+
+                // Hook-driven captures may go past the soft cap; this is the hard ceiling.
+                if (_queue.Count >= MaxQueuedJobs * 2 || _queuedBytes + job.Bytes.Length > MaxQueuedBytes * 2)
+                {
+                    WarnThrottled("drawings", "upload queue is full; dropping a capture");
+                    return false;
+                }
+
+                _queue.Enqueue(job);
+                _queuedBytes += job.Bytes.Length;
+                _queuedFingerprints[job.FingerprintKey] = job.Fingerprint;
+                return true;
+            }
+
+            private void ForgetQueued(DrawingUploadJob job)
+            {
+                string queued;
+                if (_queuedFingerprints.TryGetValue(job.FingerprintKey, out queued) && queued == job.Fingerprint)
+                    _queuedFingerprints.Remove(job.FingerprintKey);
+            }
+
+            private void PumpUploads()
+            {
+                if (_uploadInFlight || _queue.Count == 0 || Instance == null || !Instance.IsLinked) return;
+
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (now < _nextUploadAt)
+                {
+                    if (!IsInvoking(nameof(PumpUploads))) Invoke(nameof(PumpUploads), _nextUploadAt - now);
+                    return;
+                }
+
+                var pump = Engine?.Http;
+                if (pump == null) return;
+
+                var job = _queue.Dequeue();
+                _queuedBytes -= job.Bytes.Length;
+                _uploadInFlight = true;
+
+                pump.Enqueue(
+                    Instance.BuildUrl(DrawingsPath),
+                    UnityWebRequest.kHttpVerbPOST,
+                    BuildHeaders(job),
+                    null,
+                    (code, body) => OnUploadDone(job, code),
+                    HttpLane.Bulk,
+                    job.Bytes,
+                    30);
+            }
+
+            private void OnUploadDone(DrawingUploadJob job, int code)
+            {
+                _uploadInFlight = false;
+                if (this == null) return;
+
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (code >= 200 && code < 300)
+                {
+                    ForgetQueued(job);
+                    Instance?.RememberFingerprint(job.FingerprintKey, job.Fingerprint);
+                    _nextUploadAt = now + UploadSpacing;
+                }
+                else if (IsTransientHttpFailure(code) && ++job.Attempts < MaxUploadAttempts)
+                {
+                    _queue.Enqueue(job);
+                    _queuedBytes += job.Bytes.Length;
+                    _nextUploadAt = now + RetryPause;
+                }
+                else
+                {
+                    ForgetQueued(job);
+                    WarnThrottled("drawings", $"upload for entity {job.EntityNetId} failed with HTTP {code}");
+                    _nextUploadAt = now + UploadSpacing;
+                }
+
+                PumpUploads();
+            }
+
+            private static Dictionary<string, string> BuildHeaders(DrawingUploadJob job)
+            {
+                var headers = Instance.BuildHeaders(true);
+                headers["Content-Type"] = "application/octet-stream";
+                headers["X-Drawing-Event-Id"] = job.EventId;
+                headers["X-Drawing-Entity-Net-Id"] = job.EntityNetId;
+                headers["X-Drawing-Kind"] = job.Kind;
+                headers["X-Drawing-Texture-Index"] = job.TextureIndex.ToString(CultureInfo.InvariantCulture);
+                headers["X-Drawing-Entity-Prefab"] = job.EntityPrefab ?? "";
+                if (!string.IsNullOrEmpty(job.EditorSteamId))
+                    headers["X-Drawing-Editor-Steam-Id"] = job.EditorSteamId;
+                if (!string.IsNullOrEmpty(job.OwnerSteamId))
+                    headers["X-Drawing-Owner-Steam-Id"] = job.OwnerSteamId;
+                headers["X-Drawing-Pos-X"] = job.PosX.ToString("G", CultureInfo.InvariantCulture);
+                headers["X-Drawing-Pos-Y"] = job.PosY.ToString("G", CultureInfo.InvariantCulture);
+                headers["X-Drawing-Pos-Z"] = job.PosZ.ToString("G", CultureInfo.InvariantCulture);
+                if (!string.IsNullOrEmpty(job.Grid))
+                    headers["X-Drawing-Grid"] = job.Grid;
+                headers["X-Drawing-Content-Hash"] = job.ContentHash;
+                headers["X-Drawing-Wipe-Identity-Key"] = job.WipeIdentityKey;
+                headers["X-Drawing-Content-Type"] = job.ContentType ?? "image/png";
+                headers["X-Drawing-Edited-At"] = job.EditedAt;
+                return headers;
+            }
+
+            private static DrawingUploadJob BuildJob(
+                BaseEntity entity, string netId, string editorSteamId, string kind, byte[] bytes,
+                int textureIndex, string fingerprintKey, string fingerprint)
+            {
+                if (bytes == null || bytes.Length == 0) return null;
+
+                string hash = Sha256Hex(bytes);
+                Vector3 pos = PositionOf(entity);
+                return new DrawingUploadJob
+                {
+                    EventId = NewEventId(),
+                    EntityNetId = netId,
+                    Kind = kind ?? "other",
+                    TextureIndex = Math.Max(0, textureIndex),
+                    EntityPrefab = entity.PrefabName ?? "",
+                    EditorSteamId = editorSteamId ?? "",
+                    OwnerSteamId = OwnerIdOf(entity),
+                    PosX = pos.x,
+                    PosY = pos.y,
+                    PosZ = pos.z,
+                    Grid = GridLabel(pos),
+                    ContentHash = hash,
+                    WipeIdentityKey = WipeIdentityKey(),
+                    Bytes = bytes,
+                    ContentType = "image/png",
+                    EditedAt = UtcNow(),
+                    FingerprintKey = fingerprintKey,
+                    Fingerprint = fingerprint ?? hash
+                };
+            }
+
+            private static string FaceKey(string netId, int face) =>
+                "d:" + netId + ":" + face.ToString(CultureInfo.InvariantCulture);
+
+            private static uint[] FaceCrcs(BaseEntity entity)
+            {
+                var sign = entity as Signage;
+                if (sign != null && sign.textureIDs != null && sign.textureIDs.Length > 0) return sign.textureIDs;
+
+                var pumpkin = entity as CarvablePumpkin;
+                if (pumpkin != null)
+                {
+                    var ids = Members.PumpkinTextureIds(pumpkin);
+                    if (ids != null && ids.Length > 0) return ids;
+                }
+
+                var signage = entity as ISignage;
+                return signage != null ? signage.GetTextureCRCs() : null;
+            }
+
+            /// <summary>FileStorage.Get(NetworkableId, ulong slot, uint crc); the slot is the face index.</summary>
+            private static byte[] ReadFace(NetworkableId netId, int face, uint crc)
+            {
+                byte[] data;
+                try
+                {
+                    data = FileStorage.server.Get(netId, (ulong)face, crc);
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("drawings", $"FileStorage read failed for {netId.Value}: {ex.Message}");
+                    return null;
+                }
+                return data != null && data.Length > 0 && data.Length <= MaxDrawingBytes ? data : null;
+            }
+
+            /// <summary>Falls back to net id ^ owner so a sculpture without a readable CRC still lists once.</summary>
+            private static uint SculptureCrc(BaseEntity entity)
+            {
+                uint crc = Members.SculptureCrcOf(entity);
+                if (crc != 0) return crc;
+                ulong seed = entity.net.ID.Value ^ entity.OwnerID;
+                return (uint)(seed ^ (seed >> 32));
+            }
+
+            private static byte[] CaptureSculpturePng(BaseEntity entity, uint crc)
+            {
+                byte[] raw = null;
+                try
+                {
+                    raw = FileStorage.server.Get(entity.net.ID, 0UL, crc);
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("drawings", $"FileStorage read failed for sculpture {entity.net.ID.Value}: {ex.Message}");
+                }
+                return IsPngBytes(raw) ? raw : RenderSculpturePlaceholderPng(crc);
+            }
+
+            private static bool IsPngBytes(byte[] data)
+            {
+                return data != null
+                    && data.Length > 8
+                    && data[0] == 0x89
+                    && data[1] == 0x50
+                    && data[2] == 0x4E
+                    && data[3] == 0x47;
+            }
+
+            /// <summary>
+            /// Ice/rock sculptures are 3D SDF with no paint texture. The CRC is encoded into a
+            /// small PNG so each edit gets a new content hash. The panel shows the item icon.
+            /// </summary>
+            private static byte[] RenderSculpturePlaceholderPng(uint crc)
+            {
+                const int size = 256;
+                var pixels = new Color32[size * size];
+                byte r0 = (byte)(140 + ((crc >> 0) & 31));
+                byte g0 = (byte)(190 + ((crc >> 5) & 31));
+                byte b0 = (byte)(220 + ((crc >> 10) & 31));
+                uint mix = crc == 0 ? 0xA5A5A5A5u : crc;
+                for (int y = 0; y < size; y++)
+                {
+                    for (int x = 0; x < size; x++)
+                    {
+                        uint h = mix ^ (uint)(x * 374761393 + y * 668265263);
+                        h = (h ^ (h >> 13)) * 1274126177u;
+                        byte n = (byte)(h & 24);
+                        int dx = x - size / 2;
+                        int dy = y - size / 2;
+                        byte a = dx * dx + dy * dy < 90 * 90 ? (byte)255 : (byte)0;
+                        pixels[y * size + x] = new Color32(
+                            (byte)Mathf.Clamp(r0 + n, 0, 255),
+                            (byte)Mathf.Clamp(g0 + n / 2, 0, 255),
+                            (byte)Mathf.Clamp(b0 + n, 0, 255),
+                            a);
+                    }
+                }
+                return EncodePng(size, pixels);
+            }
+
+            private static string DesignFingerprint(ProtoBuf.PatternFirework.Design design)
+            {
+                var stars = design?.stars;
+                if (stars == null || stars.Count == 0) return null;
+
+                ulong hash = 14695981039346656037UL;
+                for (int i = 0; i < stars.Count; i++)
+                {
+                    var star = stars[i];
+                    hash = Mix(hash, star.position.x);
+                    hash = Mix(hash, star.position.y);
+                    hash = Mix(hash, star.color.r);
+                    hash = Mix(hash, star.color.g);
+                    hash = Mix(hash, star.color.b);
+                    hash = Mix(hash, star.color.a);
+                }
+                return "fw" + hash.ToString("x16", CultureInfo.InvariantCulture);
+            }
+
+            private static ulong Mix(ulong hash, float value)
+            {
+                unchecked
+                {
+                    hash ^= (uint)Mathf.RoundToInt(value * 10000f);
+                    return hash * 1099511628211UL;
+                }
+            }
+
+            private static byte[] RenderFireworkDesignToPng(ProtoBuf.PatternFirework.Design design)
+            {
+                var stars = design?.stars;
+                if (stars == null || stars.Count == 0) return null;
+
+                const int size = 250;
+                const int radius = 9;
+                var pixels = new Color32[size * size];
+                for (int index = 0; index < stars.Count; index++)
+                {
+                    var star = stars[index];
+                    int cx = (int)((star.position.x + 1f) * 125f);
+                    int cy = (int)((-star.position.y + 1f) * 125f);
+                    var col = new Color32(
+                        (byte)Mathf.Clamp(Mathf.RoundToInt(star.color.r * 255f), 0, 255),
+                        (byte)Mathf.Clamp(Mathf.RoundToInt(star.color.g * 255f), 0, 255),
+                        (byte)Mathf.Clamp(Mathf.RoundToInt(star.color.b * 255f), 0, 255),
+                        (byte)Mathf.Clamp(Mathf.RoundToInt(star.color.a * 255f), 0, 255));
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        for (int dx = -radius; dx <= radius; dx++)
+                        {
+                            if (dx * dx + dy * dy > radius * radius) continue;
+                            int x = cx + dx;
+                            int y = cy + dy;
+                            if (x < 0 || x >= size || y < 0 || y >= size) continue;
+                            pixels[y * size + x] = col;
+                        }
+                    }
+                }
+                return EncodePng(size, pixels);
+            }
+
+            private static byte[] EncodePng(int size, Color32[] pixels)
+            {
+                var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+                try
+                {
+                    tex.SetPixels32(pixels);
+                    tex.Apply(false, false);
+                    return tex.EncodeToPNG();
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("drawings", $"PNG encode failed: {ex.Message}");
+                    return null;
+                }
+                finally
+                {
+                    UnityEngine.Object.Destroy(tex);
+                }
+            }
+        }
+
+        private class DrawingUploadJob
+        {
+            public string EventId;
+            public string EntityNetId;
+            public string Kind;
+            public int TextureIndex;
+            public string EntityPrefab;
+            public string EditorSteamId;
+            public string OwnerSteamId;
+            public float PosX;
+            public float PosY;
+            public float PosZ;
+            public string Grid;
+            public string ContentHash;
+            public string WipeIdentityKey;
+            public byte[] Bytes;
+            public string ContentType;
+            public string EditedAt;
+            public string FingerprintKey;
+            public string Fingerprint;
+            public int Attempts;
+        }
+
+        /// <summary>
+        /// Text PGC: vending shop names + sleeping bag / bed nicknames.
+        /// </summary>
+        private class NamedContentWorker : RCoreWorker
+        {
+            private const int MaxPending = 5000;
+            private const int UploadBatch = 200;
+            private const int MaxGoneBatch = 500;
+            private const float RescanInterval = 30f;
+            private const float ReconcileInterval = 300f;
+            private const float ChainDelay = 1.5f;
+
+            private readonly Dictionary<string, NamedContentItemDto> _pending = new Dictionary<string, NamedContentItemDto>(StringComparer.Ordinal);
+            /// <summary>netId → last title sent or queued, compared without allocating.</summary>
+            private readonly Dictionary<ulong, string> _titles = new Dictionary<ulong, string>();
+            private readonly List<string> _destroyBuffer = new List<string>(32);
+            private readonly HashSet<string> _destroyPending = new HashSet<string>();
+            private bool _uploadInFlight;
+            private bool _goneInFlight;
+            private bool _syncQueued;
+            private bool _syncRunning;
+            private bool _synced;
+            private float _syncAt = -1f;
+            private float _nextRescanAt = -1f;
+            private float _nextReconcileAt = -1f;
+
+            protected override float Interval => 5f;
+
+            public void RequestFullSync(float delay)
+            {
+                _syncQueued = true;
+                _syncAt = UnityEngine.Time.realtimeSinceStartup + Mathf.Max(0.5f, delay);
+            }
+
+            public void EnqueueDestroy(string netId)
+            {
+                if (string.IsNullOrEmpty(netId)) return;
+                if (!_destroyPending.Add(netId)) return;
+                _destroyBuffer.Add(netId);
+                _pending.Remove(netId);
+
+                ulong raw;
+                if (ulong.TryParse(netId, NumberStyles.Integer, CultureInfo.InvariantCulture, out raw))
+                    _titles.Remove(raw);
+                Instance?.ForgetFingerprint(NamedKey(netId));
+            }
+
+            /// <summary>Queues the entity when its title differs from the last one sent or queued.</summary>
+            public void ObserveEntity(BaseEntity entity)
+            {
+                string kind;
+                string title;
+                if (!TryReadTitle(entity, out kind, out title)) return;
+
+                ulong id = entity.net.ID.Value;
+                string previous;
+                if (_titles.TryGetValue(id, out previous) && string.Equals(previous, title, StringComparison.Ordinal))
+                    return;
+
+                if (QueueItem(entity, NetIdOf(entity), kind, title)) _titles[id] = title;
+            }
+
+            protected override void Tick()
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+
+                if (_syncQueued && now >= _syncAt && !_syncRunning)
+                {
+                    _syncQueued = false;
+                    StartCoroutine(RunFullSync());
+                }
+
+                if (_nextRescanAt < 0f) _nextRescanAt = now + RescanInterval;
+                if (_synced && !_syncRunning && now >= _nextRescanAt)
+                {
+                    _nextRescanAt = now + RescanInterval;
+                    Rescan();
+                }
+
+                if (_destroyBuffer.Count > 0 && !_goneInFlight)
+                {
+                    FlushDestroy();
+                    return;
+                }
+
+                bool reconcile = false;
+                if (_nextReconcileAt < 0f) _nextReconcileAt = now + ReconcileInterval;
+                if (_synced && !_syncRunning && now >= _nextReconcileAt)
+                {
+                    _nextReconcileAt = now + ReconcileInterval;
+                    reconcile = true;
+                }
+
+                Flush(reconcile);
+            }
+
+            private IEnumerator RunFullSync()
+            {
+                _syncRunning = true;
+                try
+                {
+                    var wait = new WaitForSeconds(1f);
+                    var index = Instance?._content;
+                    while (index != null && !index.Ready) yield return wait;
+                    if (index == null) yield break;
+
+                    var entities = index.Live(index.Named);
+                    float sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                    for (int i = 0; i < entities.Count; i++)
+                    {
+                        if (Instance == null || !Instance.IsLinked) yield break;
+                        SyncEntity(entities[i]);
+
+                        if (UnityEngine.Time.realtimeSinceStartup - sliceStart >= FrameBudgetSeconds)
+                        {
+                            yield return null;
+                            sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                        }
+                    }
+
+                    _synced = true;
+                    _nextReconcileAt = 0f;
+                }
+                finally
+                {
+                    _syncRunning = false;
+                }
+            }
+
+            private void SyncEntity(BaseEntity entity)
+            {
+                string kind;
+                string title;
+                if (!TryReadTitle(entity, out kind, out title)) return;
+
+                ulong id = entity.net.ID.Value;
+                string previous;
+                if (_titles.TryGetValue(id, out previous) && string.Equals(previous, title, StringComparison.Ordinal))
+                    return;
+
+                string netId = NetIdOf(entity);
+                if (Instance.HasFingerprint(NamedKey(netId), kind + "|" + title))
+                {
+                    _titles[id] = title;
+                    return;
+                }
+
+                if (QueueItem(entity, netId, kind, title)) _titles[id] = title;
+            }
+
+            /// <summary>Picks up renames after placement; there is no rename hook for bags and shops.</summary>
+            private void Rescan()
+            {
+                var index = Instance?._content;
+                if (index == null || !index.Ready) return;
+                var entities = index.Live(index.Named);
+                for (int i = 0; i < entities.Count; i++) ObserveEntity(entities[i]);
+            }
+
+            private bool QueueItem(BaseEntity entity, string netId, string kind, string title)
+            {
+                if (!_pending.ContainsKey(netId) && _pending.Count >= MaxPending)
+                {
+                    WarnThrottled("named-content", "pending queue is full; dropping a title update");
+                    return false;
+                }
+
+                Vector3 pos = PositionOf(entity);
+                _pending[netId] = new NamedContentItemDto
+                {
+                    EntityNetId = netId,
+                    Kind = kind,
+                    Title = title,
+                    PosX = pos.x,
+                    PosY = pos.y,
+                    PosZ = pos.z,
+                    Grid = GridLabel(pos),
+                    OwnerSteamId = OwnerIdOf(entity),
+                    WipeIdentityKey = WipeIdentityKey()
+                };
+                return true;
+            }
+
+            private void FlushPending()
+            {
+                if (Ready && Instance != null && Instance.IsLinked) Flush(false);
+            }
+
+            private void Flush(bool reconcile)
+            {
+                if (_uploadInFlight || Instance == null) return;
+
+                List<string> live = null;
+                if (reconcile)
+                {
+                    var index = Instance._content;
+                    if (index != null && index.Ready)
+                    {
+                        live = ContentIndex.NetIds(index.Live(index.Named));
+                        if (live.Count > MaxReconcileNetIds)
+                        {
+                            WarnThrottled("named-content", $"{live.Count} shops and bags exceed the reconcile cap of {MaxReconcileNetIds}; skipping reconcile");
+                            live = null;
+                        }
+                    }
+                    reconcile = live != null;
+                }
+
+                if (_pending.Count == 0 && !reconcile) return;
+
+                var batch = TakePending(UploadBatch);
+                var payload = new NamedContentBatchDto
+                {
+                    Items = new List<NamedContentItemWire>(batch.Count),
+                    Reconcile = reconcile,
+                    LiveNetIds = live,
+                    WipeIdentityKey = reconcile ? WipeIdentityKey() : null
+                };
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var src = batch[i];
+                    payload.Items.Add(new NamedContentItemWire
+                    {
+                        EntityNetId = src.EntityNetId,
+                        Kind = src.Kind,
+                        Title = src.Title,
+                        PosX = src.PosX,
+                        PosY = src.PosY,
+                        PosZ = src.PosZ,
+                        Grid = src.Grid,
+                        OwnerSteamId = string.IsNullOrEmpty(src.OwnerSteamId) ? null : src.OwnerSteamId,
+                        WipeIdentityKey = src.WipeIdentityKey
+                    });
+                }
+
+                _uploadInFlight = true;
+                Send<JObject>(NamedContentPath, payload,
+                    _ =>
+                    {
+                        _uploadInFlight = false;
+                        for (int i = 0; i < batch.Count; i++)
+                            Instance?.RememberFingerprint(NamedKey(batch[i].EntityNetId), batch[i].Kind + "|" + batch[i].Title);
+                        if (_pending.Count > 0 && !IsInvoking(nameof(FlushPending)))
+                            Invoke(nameof(FlushPending), ChainDelay);
+                    },
+                    (code, response) =>
+                    {
+                        _uploadInFlight = false;
+                        if (IsTransientHttpFailure(code))
+                        {
+                            Requeue(batch);
+                            return;
+                        }
+                        WarnThrottled("named-content", $"batch rejected with HTTP {code}");
+                    });
+            }
+
+            private List<NamedContentItemDto> TakePending(int max)
+            {
+                var batch = new List<NamedContentItemDto>(Math.Min(max, _pending.Count));
+                foreach (var pair in _pending)
+                {
+                    if (batch.Count >= max) break;
+                    batch.Add(pair.Value);
+                }
+                for (int i = 0; i < batch.Count; i++) _pending.Remove(batch[i].EntityNetId);
+                return batch;
+            }
+
+            private void Requeue(List<NamedContentItemDto> batch)
+            {
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var item = batch[i];
+                    if (!_pending.ContainsKey(item.EntityNetId)) _pending[item.EntityNetId] = item;
+                }
+            }
+
+            private void FlushDestroy()
+            {
+                int take = Math.Min(MaxGoneBatch, _destroyBuffer.Count);
+                var batch = _destroyBuffer.GetRange(0, take);
+                _destroyBuffer.RemoveRange(0, take);
+                for (int i = 0; i < batch.Count; i++) _destroyPending.Remove(batch[i]);
+
+                _goneInFlight = true;
+                Send<JObject>(
+                    NamedContentGonePath,
+                    new Dictionary<string, object> { ["entityNetIds"] = batch },
+                    _ => { _goneInFlight = false; },
+                    (code, body) => { _goneInFlight = false; });
+            }
+
+            private static string NamedKey(string netId) => "n:" + netId;
+
+            private static bool TryReadTitle(BaseEntity entity, out string kind, out string title)
+            {
+                kind = null;
+                title = null;
+                if (entity == null || entity.IsDestroyed || entity.net == null) return false;
+
+                var vm = entity as VendingMachine;
+                if (vm != null)
+                {
+                    kind = "shop";
+                    title = vm.shopName;
+                }
+                else
+                {
+                    var bag = entity as SleepingBag;
+                    if (bag == null) return false;
+                    kind = "sleeping_bag";
+                    title = bag.niceName;
+                }
+
+                title = title?.Trim();
+                if (string.IsNullOrEmpty(title)) return false;
+                if (title.Length > 128) title = title.Substring(0, 128);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Voice Props cassettes: FileStorage ogg blob → POST /api/ingest/audio, with the
+        /// cassette's audio CRC as the change fingerprint.
+        /// </summary>
+        private class AudioWorker : RCoreWorker
+        {
+            private const int MaxQueuedJobs = 64;
+            private const long MaxQueuedBytes = 32L * 1024 * 1024;
+            private const int MaxGoneBatch = 500;
+            private const int MaxUploadAttempts = 3;
+            private const float RescanInterval = 25f;
+            private const float ReconcileInterval = 300f;
+            private const float RetryPause = 15f;
+
+            private readonly Queue<AudioUploadJob> _queue = new Queue<AudioUploadJob>();
+            /// <summary>netId → audio CRC last sent or queued.</summary>
+            private readonly Dictionary<ulong, uint> _crcByNetId = new Dictionary<ulong, uint>();
+            private readonly List<string> _destroyBuffer = new List<string>(32);
+            private readonly HashSet<string> _destroyPending = new HashSet<string>();
+            private long _queuedBytes;
+            private bool _uploadInFlight;
+            private float _nextUploadAt;
+            private bool _goneInFlight;
+            private bool _reconcileInFlight;
+            private bool _syncQueued;
+            private bool _syncRunning;
+            private bool _synced;
+            private float _syncAt = -1f;
+            private float _nextRescanAt = -1f;
+            private float _nextReconcileAt = -1f;
+
+            protected override float Interval => 3f;
+
+            private bool QueueBusy => _queue.Count >= MaxQueuedJobs || _queuedBytes >= MaxQueuedBytes;
+
+            public void RequestFullSync(float delay)
+            {
+                _syncQueued = true;
+                _syncAt = UnityEngine.Time.realtimeSinceStartup + Mathf.Max(0.5f, delay);
+            }
+
+            public void EnqueueDestroy(string netId)
+            {
+                if (string.IsNullOrEmpty(netId)) return;
+                if (!_destroyPending.Add(netId)) return;
+                _destroyBuffer.Add(netId);
+                ForgetCrc(netId);
+            }
+
+            /// <summary>Forget the cached CRC after panel audio_clear (entity kept, bytes wiped).</summary>
+            public void ForgetCrc(string netId)
+            {
+                if (string.IsNullOrEmpty(netId)) return;
+                ulong raw;
+                if (ulong.TryParse(netId, NumberStyles.Integer, CultureInfo.InvariantCulture, out raw))
+                    _crcByNetId.Remove(raw);
+                Instance?.ForgetFingerprint(AudioKey(netId));
+            }
+
+            protected override void Tick()
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+
+                if (_syncQueued && now >= _syncAt && !_syncRunning)
+                {
+                    _syncQueued = false;
+                    StartCoroutine(RunFullSync());
+                }
+
+                if (_nextRescanAt < 0f) _nextRescanAt = now + RescanInterval;
+                if (_synced && !_syncRunning && now >= _nextRescanAt)
+                {
+                    _nextRescanAt = now + RescanInterval;
+                    Rescan();
+                }
+
+                if (_nextReconcileAt < 0f) _nextReconcileAt = now + ReconcileInterval;
+                if (_synced && !_syncRunning && now >= _nextReconcileAt)
+                {
+                    _nextReconcileAt = now + ReconcileInterval;
+                    Reconcile();
+                }
+
+                if (_destroyBuffer.Count > 0 && !_goneInFlight)
+                    FlushDestroy();
+
+                UploadNext();
+            }
+
+            private IEnumerator RunFullSync()
+            {
+                _syncRunning = true;
+                try
+                {
+                    var wait = new WaitForSeconds(1f);
+                    var index = Instance?._content;
+                    while (index != null && !index.Ready) yield return wait;
+                    if (index == null) yield break;
+
+                    var entities = index.Live(index.Cassettes);
+                    float sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                    for (int i = 0; i < entities.Count; i++)
+                    {
+                        while (QueueBusy && Instance != null && Instance.IsLinked) yield return wait;
+                        if (Instance == null || !Instance.IsLinked) yield break;
+
+                        TryQueue(entities[i], null);
+
+                        if (UnityEngine.Time.realtimeSinceStartup - sliceStart >= FrameBudgetSeconds)
+                        {
+                            yield return null;
+                            sliceStart = UnityEngine.Time.realtimeSinceStartup;
+                        }
+                    }
+
+                    _synced = true;
+                    _nextReconcileAt = 0f;
+                }
+                finally
+                {
+                    _syncRunning = false;
+                }
+            }
+
+            private void Rescan()
+            {
+                var index = Instance?._content;
+                if (index == null || !index.Ready) return;
+                var entities = index.Live(index.Cassettes);
+                for (int i = 0; i < entities.Count && !QueueBusy; i++) TryQueue(entities[i], null);
+            }
+
+            private bool TryQueue(BaseEntity entity, string recorderSteamId)
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null || QueueBusy) return false;
+
+                uint crc = Members.CassetteAudioIdOf(entity);
+                if (crc == 0) return false;
+
+                ulong id = entity.net.ID.Value;
+                uint previous;
+                if (_crcByNetId.TryGetValue(id, out previous) && previous == crc) return false;
+
+                string netId = NetIdOf(entity);
+                if (Instance.HasFingerprint(AudioKey(netId), crc.ToString(CultureInfo.InvariantCulture)))
+                {
+                    _crcByNetId[id] = crc;
+                    return false;
+                }
+
+                byte[] bytes = ReadCassetteBytes(entity.net.ID, crc);
+                if (bytes == null) return false;
+
+                _queue.Enqueue(BuildJob(entity, id, netId, recorderSteamId, bytes, crc));
+                _queuedBytes += bytes.Length;
+                _crcByNetId[id] = crc;
+                return true;
+            }
+
+            private void Reconcile()
+            {
+                var index = Instance?._content;
+                if (_reconcileInFlight || index == null || !index.Ready) return;
+
+                var live = ContentIndex.NetIds(index.Live(index.Cassettes));
+                if (live.Count > MaxReconcileNetIds)
+                {
+                    WarnThrottled("audio", $"{live.Count} cassettes exceed the reconcile cap of {MaxReconcileNetIds}; skipping reconcile");
+                    return;
+                }
+
+                _reconcileInFlight = true;
+                Send<JObject>(
+                    AudioReconcilePath,
+                    new Dictionary<string, object>
+                    {
+                        ["wipeIdentityKey"] = WipeIdentityKey(),
+                        ["liveNetIds"] = live
+                    },
+                    _ => { _reconcileInFlight = false; },
+                    (code, body) => { _reconcileInFlight = false; });
+            }
+
+            private void FlushDestroy()
+            {
+                int take = Math.Min(MaxGoneBatch, _destroyBuffer.Count);
+                var batch = _destroyBuffer.GetRange(0, take);
+                _destroyBuffer.RemoveRange(0, take);
+                for (int i = 0; i < batch.Count; i++) _destroyPending.Remove(batch[i]);
+
+                _goneInFlight = true;
+                Send<JObject>(
+                    AudioGonePath,
+                    new Dictionary<string, object> { ["netIds"] = batch },
+                    _ => { _goneInFlight = false; },
+                    (code, body) => { _goneInFlight = false; });
+            }
+
+            private void UploadNext()
+            {
+                if (_uploadInFlight || _queue.Count == 0) return;
+                if (UnityEngine.Time.realtimeSinceStartup < _nextUploadAt) return;
+
+                var pump = Engine?.Http;
+                if (pump == null) return;
+
+                var job = _queue.Dequeue();
+                _queuedBytes -= job.Bytes.Length;
+                _uploadInFlight = true;
+
+                pump.Enqueue(
+                    Instance.BuildUrl(AudioPath),
+                    UnityWebRequest.kHttpVerbPOST,
+                    BuildHeaders(job),
+                    null,
+                    (code, body) => OnUploadDone(job, code),
+                    HttpLane.Bulk,
+                    job.Bytes,
+                    30);
+            }
+
+            private void OnUploadDone(AudioUploadJob job, int code)
+            {
+                _uploadInFlight = false;
+                if (this == null) return;
+
+                if (code >= 200 && code < 300)
+                {
+                    Instance?.RememberFingerprint(AudioKey(job.EntityNetId), job.AudioCrc.ToString(CultureInfo.InvariantCulture));
+                    return;
+                }
+
+                if (IsTransientHttpFailure(code) && ++job.Attempts < MaxUploadAttempts)
+                {
+                    _queue.Enqueue(job);
+                    _queuedBytes += job.Bytes.Length;
+                    _nextUploadAt = UnityEngine.Time.realtimeSinceStartup + RetryPause;
+                    return;
+                }
+
+                uint queued;
+                if (_crcByNetId.TryGetValue(job.NetId, out queued) && queued == job.AudioCrc)
+                    _crcByNetId.Remove(job.NetId);
+                WarnThrottled("audio", $"upload for entity {job.EntityNetId} failed with HTTP {code}");
+            }
+
+            private static Dictionary<string, string> BuildHeaders(AudioUploadJob job)
+            {
+                var headers = Instance.BuildHeaders(true);
+                headers["Content-Type"] = "application/octet-stream";
+                headers["X-Audio-Event-Id"] = job.EventId;
+                headers["X-Audio-Entity-Net-Id"] = job.EntityNetId;
+                headers["X-Audio-Kind"] = job.Kind;
+                headers["X-Audio-Entity-Prefab"] = job.EntityPrefab ?? "";
+                if (!string.IsNullOrEmpty(job.OwnerSteamId))
+                    headers["X-Audio-Owner-Steam-Id"] = job.OwnerSteamId;
+                if (!string.IsNullOrEmpty(job.RecorderSteamId))
+                    headers["X-Audio-Recorder-Steam-Id"] = job.RecorderSteamId;
+                headers["X-Audio-Pos-X"] = job.PosX.ToString("G", CultureInfo.InvariantCulture);
+                headers["X-Audio-Pos-Y"] = job.PosY.ToString("G", CultureInfo.InvariantCulture);
+                headers["X-Audio-Pos-Z"] = job.PosZ.ToString("G", CultureInfo.InvariantCulture);
+                if (!string.IsNullOrEmpty(job.Grid))
+                    headers["X-Audio-Grid"] = job.Grid;
+                headers["X-Audio-Content-Hash"] = job.ContentHash;
+                headers["X-Audio-Wipe-Identity-Key"] = job.WipeIdentityKey;
+                headers["X-Audio-Content-Type"] = job.ContentType ?? "audio/ogg";
+                if (job.DurationMs.HasValue)
+                    headers["X-Audio-Duration-Ms"] = job.DurationMs.Value.ToString(CultureInfo.InvariantCulture);
+                headers["X-Audio-Recorded-At"] = job.RecordedAt;
+                return headers;
+            }
+
+            private static AudioUploadJob BuildJob(BaseEntity entity, ulong id, string netId, string recorderSteamId, byte[] bytes, uint crc)
+            {
+                Vector3 pos = PositionOf(entity);
+                float maxLength = Members.CassetteLengthOf(entity);
+
+                return new AudioUploadJob
+                {
+                    EventId = NewEventId(),
+                    NetId = id,
+                    EntityNetId = netId,
+                    Kind = ClassifyAudioKind(entity),
+                    EntityPrefab = entity.PrefabName ?? "",
+                    OwnerSteamId = OwnerIdOf(entity),
+                    RecorderSteamId = recorderSteamId ?? "",
+                    PosX = pos.x,
+                    PosY = pos.y,
+                    PosZ = pos.z,
+                    Grid = GridLabel(pos),
+                    ContentHash = Sha256Hex(bytes),
+                    WipeIdentityKey = WipeIdentityKey(),
+                    Bytes = bytes,
+                    ContentType = IsOggHeader(bytes) ? "audio/ogg" : "application/octet-stream",
+                    DurationMs = maxLength > 0f ? Mathf.RoundToInt(maxLength * 1000f) : (int?)null,
+                    RecordedAt = UtcNow(),
+                    AudioCrc = crc
+                };
+            }
+
+            private static string AudioKey(string netId) => "a:" + netId;
+
+            private static string ClassifyAudioKind(BaseEntity entity)
+            {
+                string name = entity.ShortPrefabName ?? entity.PrefabName ?? "";
+                if (ContainsText(name, "boombox") || ContainsText(name, "boom_box")) return "boombox";
+                if (ContainsText(name, "recorder")) return "recorder";
+                if (ContainsText(name, "cassette")) return "cassette";
+                return "other";
+            }
+
+            private static byte[] ReadCassetteBytes(NetworkableId netId, uint crc)
+            {
+                byte[] data = null;
+                try
+                {
+                    data = FileStorage.server.Get(netId, 0UL, crc);
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("audio", $"FileStorage read failed for {netId.Value}: {ex.Message}");
+                }
+                if (data == null || data.Length == 0) data = Members.TypedAudioGet(crc, netId);
+                return data != null && data.Length > 0 && data.Length <= MaxAudioBytes ? data : null;
+            }
+
+            private static bool IsOggHeader(byte[] data)
+            {
+                return data != null
+                    && data.Length >= 4
+                    && data[0] == (byte)'O'
+                    && data[1] == (byte)'g'
+                    && data[2] == (byte)'g'
+                    && data[3] == (byte)'S';
+            }
+        }
+
+        private class AudioUploadJob
+        {
+            public string EventId;
+            public ulong NetId;
+            public string EntityNetId;
+            public string Kind;
+            public string EntityPrefab;
+            public string OwnerSteamId;
+            public string RecorderSteamId;
+            public float PosX;
+            public float PosY;
+            public float PosZ;
+            public string Grid;
+            public string ContentHash;
+            public string WipeIdentityKey;
+            public byte[] Bytes;
+            public string ContentType;
+            public int? DurationMs;
+            public string RecordedAt;
+            public uint AudioCrc;
+            public int Attempts;
+        }
+
+        private class NamedContentItemDto
+        {
+            public string EntityNetId;
+            public string Kind;
+            public string Title;
+            public float PosX;
+            public float PosY;
+            public float PosZ;
+            public string Grid;
+            public string OwnerSteamId;
+            public string WipeIdentityKey;
+        }
+
+        private class NamedContentBatchDto
+        {
+            [JsonProperty("items")] public List<NamedContentItemWire> Items;
+            [JsonProperty("reconcile", NullValueHandling = NullValueHandling.Ignore)] public bool? Reconcile;
+            [JsonProperty("liveNetIds", NullValueHandling = NullValueHandling.Ignore)] public List<string> LiveNetIds;
+            [JsonProperty("wipeIdentityKey", NullValueHandling = NullValueHandling.Ignore)] public string WipeIdentityKey;
+        }
+
+        private class NamedContentItemWire
+        {
+            [JsonProperty("entityNetId")] public string EntityNetId;
+            [JsonProperty("kind")] public string Kind;
+            [JsonProperty("title")] public string Title;
+            [JsonProperty("posX")] public float PosX;
+            [JsonProperty("posY")] public float PosY;
+            [JsonProperty("posZ")] public float PosZ;
+            [JsonProperty("grid", NullValueHandling = NullValueHandling.Ignore)] public string Grid;
+            [JsonProperty("ownerSteamId", NullValueHandling = NullValueHandling.Ignore)] public string OwnerSteamId;
+            [JsonProperty("wipeIdentityKey")] public string WipeIdentityKey;
         }
 
         private class QueueWorker : RCoreWorker
@@ -1493,6 +3953,138 @@ namespace Oxide.Plugins
         {
             SetPendingWipe(true);
             SendWipe();
+            _engine?.Drawings?.RequestFullSync(15f);
+            _engine?.NamedContent?.RequestFullSync(16f);
+            _engine?.Audio?.RequestFullSync(17f);
+        }
+
+        private void OnSignUpdated(Signage sign, BasePlayer player, int textureIndex)
+        {
+            if (!IsLinked || sign == null || sign.IsDestroyed) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.ScheduleCapture(sign, editor, Math.Max(0, textureIndex), PaintableKind(sign));
+        }
+
+        private void OnSignUpdated(Signage sign, BasePlayer player)
+        {
+            OnSignUpdated(sign, player, 0);
+        }
+
+        private void OnSignUpdated(PhotoFrame frame, BasePlayer player)
+        {
+            if (!IsLinked || frame == null || frame.IsDestroyed) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.ScheduleCapture(frame, editor, 0, "photo_frame");
+        }
+
+        private void OnSignUpdated(CarvablePumpkin pumpkin, BasePlayer player)
+        {
+            if (!IsLinked || pumpkin == null || pumpkin.IsDestroyed) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.ScheduleCapture(pumpkin, editor, 0, "pumpkin");
+        }
+
+        private void OnItemPainted(PaintedItemStorageEntity entity, Item item, BasePlayer player, byte[] image)
+        {
+            if (!IsLinked || entity == null || entity.IsDestroyed || image == null || image.Length == 0) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.EnqueueBytes(entity, editor, "painted_item", image, 0);
+        }
+
+        private void OnFireworkDesignChanged(PatternFirework firework, ProtoBuf.PatternFirework.Design design, BasePlayer player)
+        {
+            if (!IsLinked || firework == null || firework.IsDestroyed || design == null) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.EnqueueFirework(firework, design, editor, force: true);
+        }
+
+        private void OnImagePost(BasePlayer player, string url, bool raw, ISignage signage, uint textureIndex)
+        {
+            if (!IsLinked || signage == null) return;
+            var ent = signage as BaseEntity;
+            if (ent == null || ent.IsDestroyed) return;
+            string editor = player != null ? player.UserIDString : null;
+            _engine?.Drawings?.ScheduleCapture(ent, editor, (int)textureIndex, PaintableKind(ent));
+        }
+
+        private void OnEntitySpawned(BaseNetworkable entity) => _content.Add(entity);
+
+        private void OnEntityBuilt(Planner plan, GameObject go)
+        {
+            if (!IsLinked || plan == null || go == null) return;
+            var ent = go.ToBaseEntity();
+            if (ent == null) return;
+
+            if (ent is VendingMachine || ent is SleepingBag)
+            {
+                NextTick(() => _engine?.NamedContent?.ObserveEntity(ent));
+                return;
+            }
+
+            var player = plan.GetOwnerPlayer();
+            string editor = player != null ? player.UserIDString : null;
+
+            if (ent is BaseSculpture)
+            {
+                // FileStorage gets the sculpture CRC shortly after placement.
+                timer.Once(0.5f, () => _engine?.Drawings?.EnqueueSculpture(ent, editor, force: true));
+                return;
+            }
+
+            var signage = ent as ISignage;
+            if (signage == null) return;
+            NextTick(() =>
+            {
+                if (ent == null || ent.IsDestroyed || ent.net == null) return;
+                var crcs = signage.GetTextureCRCs();
+                if (crcs == null || crcs.Length == 0 || crcs[0] == 0) return;
+                _engine?.Drawings?.ScheduleCapture(ent, editor, 0, PaintableKind(ent));
+            });
+        }
+
+        private void OnEntityKill(BaseNetworkable entity)
+        {
+            if (entity == null || entity.net == null) return;
+            var kind = _content.Remove(entity);
+            if (kind == ContentKind.None || !IsLinked || _engine == null) return;
+
+            string netId = NetIdOf(entity);
+            switch (kind)
+            {
+                case ContentKind.Paintable:
+                    _engine.Drawings?.EnqueueDestroy(netId);
+                    break;
+                case ContentKind.Named:
+                    _engine.NamedContent?.EnqueueDestroy(netId);
+                    break;
+                case ContentKind.Cassette:
+                    _engine.Audio?.EnqueueDestroy(netId);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// An inventory cassette destroyed through the item (F1 destroy, drop-clear) can skip
+        /// the entity kill path, so resolve its held entity here.
+        /// </summary>
+        private void OnItemRemove(Item item)
+        {
+            if (item?.info == null) return;
+
+            bool isCassette;
+            int itemId = item.info.itemid;
+            if (!_cassetteItemIds.TryGetValue(itemId, out isCassette))
+            {
+                isCassette = (item.info.shortname ?? "").IndexOf("cassette", StringComparison.OrdinalIgnoreCase) >= 0;
+                _cassetteItemIds[itemId] = isCassette;
+            }
+            if (!isCassette) return;
+
+            var held = item.GetHeldEntity();
+            if (held == null || held.net == null) return;
+
+            _content.Remove(held);
+            if (IsLinked) _engine?.Audio?.EnqueueDestroy(NetIdOf(held));
         }
 
         private void OnClientAuth(Network.Connection connection)
@@ -1521,15 +4113,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (IsLinked)
-            {
-                float now = UnityEngine.Time.realtimeSinceStartup;
-                if (now - _lastLoginSync >= LoginSyncDebounce)
-                {
-                    _lastLoginSync = now;
-                    _engine?.RequestFullSync(2f);
-                }
-            }
+            if (IsLinked) _engine?.RequestFullSync(2f);
 
             if (IsLinked && IsRealSteamId(player.userID))
             {
@@ -1540,6 +4124,8 @@ namespace Oxide.Plugins
             string muteReason, muteTime;
             if (IsMuted(player, out muteReason, out muteTime))
                 player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, true);
+
+            if (IsLinked) _engine?.Runtime?.OnPlayerConnected(player);
         }
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
@@ -1549,6 +4135,7 @@ namespace Oxide.Plugins
             _woundedHits.Remove(player.UserIDString);
             _engine?.RecordDisconnect(player.UserIDString, reason);
             _engine?.RequestFullSync(1f);
+            _engine?.Runtime?.RecordEvent("player.disconnected", player);
         }
 
         private void OnTeamCreated(BasePlayer player, RelationshipManager.PlayerTeam team)
@@ -1635,7 +4222,7 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            // Ingest happens in OnClientCommand — IQChat always returns false from OnPlayerChat.
+            // Ingest happens in OnClientCommand, IQChat always returns false from OnPlayerChat.
             return null;
         }
 
@@ -1723,7 +4310,9 @@ namespace Oxide.Plugins
 
         private void OnPlayerRespawned(BasePlayer player)
         {
-            if (player != null) _woundedHits.Remove(player.UserIDString);
+            if (player == null) return;
+            _woundedHits.Remove(player.UserIDString);
+            _engine?.Runtime?.RecordEvent("player.respawned", player);
         }
 
         private void OnPlayerRecovered(BasePlayer player)
@@ -1741,7 +4330,28 @@ namespace Oxide.Plugins
             bool hasWound = _woundedHits.TryGetValue(victimId, out wound);
             _woundedHits.Remove(victimId);
 
-            combat.Enqueue(BuildDeathEvent(player, info, hasWound, wound));
+            var death = BuildDeathEvent(player, info, hasWound, wound);
+            // Only PvP kills are reported. PvE, suicide and environment deaths are skipped.
+            if (death.DeathType != "pvp"
+                || string.IsNullOrEmpty(death.KillerSteamId)
+                || death.KillerSteamId == death.VictimSteamId)
+                return;
+
+            ulong victimUserId = player.userID;
+            NextTick(() =>
+            {
+                if (_engine?.Combat == null) return;
+                try
+                {
+                    death.CombatLog = ReadVictimCombatLog(victimUserId);
+                }
+                catch (Exception ex)
+                {
+                    _engine.RaiseAlert("combatlog_error", $"CombatLog.Get failed for {victimId}: {ex.Message}",
+                        new { victimSteamId = victimId, side = "victim" });
+                }
+                _engine.Combat.Enqueue(death);
+            });
         }
 
         #endregion
@@ -1760,7 +4370,11 @@ namespace Oxide.Plugins
                 ["unmute"] = HandleUnmuteTask,
                 ["kick"] = HandleKickTask,
                 ["teleport"] = HandleTeleportTask,
-                ["give"] = HandleGiveTask
+                ["give"] = HandleGiveTask,
+                ["drawing_clear"] = HandleDrawingClearTask,
+                ["named_content_clear"] = HandleNamedContentClearTask,
+                ["audio_clear"] = HandleAudioClearTask,
+                ["action"] = HandleActionTask
             };
         }
 
@@ -1821,11 +4435,8 @@ namespace Oxide.Plugins
 
             _engine?.Queue?.ScheduleWriteCfg();
 
-            if (ulong.TryParse(task.SteamId, out ulong uid))
-            {
-                var online = BasePlayer.FindByID(uid);
-                if (online != null && online.IsConnected) online.Kick("Banned: " + reason);
-            }
+            var online = FindConnectedPlayer(task.SteamId);
+            if (online != null) online.Kick("Banned: " + reason);
 
             if (task.Announce)
             {
@@ -1856,6 +4467,183 @@ namespace Oxide.Plugins
 
         private static bool IsIdempotentPunishment(string type) =>
             type == "mute" || type == "unmute" || type == "ban" || type == "unban";
+
+        private TaskResult HandleDrawingClearTask(JToken raw)
+        {
+            var task = Parse<DrawingClearTaskDto>(raw);
+            BaseEntity ent;
+            TaskResult error;
+            if (!TryFindTaskEntity(task?.EntityNetId, out ent, out error)) return error;
+
+            try
+            {
+                if (ent is Signage signage)
+                    ClearSignageTextures(signage);
+                else if (ent is PhotoFrame frame)
+                    ClearPhotoFrameTextures(frame);
+                else if (ent is CarvablePumpkin pumpkin)
+                    ClearPumpkinTextures(pumpkin);
+                else if (ent is BaseSculpture sculpture)
+                    ClearBaseSculpture(sculpture);
+                else if (ent is PatternFirework firework)
+                    ClearFireworkDesign(firework);
+                else if (ent is PaintedItemStorageEntity painted)
+                {
+                    if (!Members.ClearPaintedImage(painted))
+                        return TaskResult.Fail("UNSUPPORTED", "painted item image field not found on this build");
+                    painted.SendNetworkUpdate();
+                }
+                else
+                    return TaskResult.Fail("UNSUPPORTED", ent.ShortPrefabName ?? "entity");
+            }
+            catch (Exception ex)
+            {
+                return TaskResult.Fail("CLEAR_FAILED", ex.Message);
+            }
+
+            return TaskResult.Ok();
+        }
+
+        private TaskResult HandleNamedContentClearTask(JToken raw)
+        {
+            var task = Parse<NamedContentClearTaskDto>(raw);
+            BaseEntity ent;
+            TaskResult error;
+            if (!TryFindTaskEntity(task?.EntityNetId, out ent, out error)) return error;
+
+            try
+            {
+                var vm = ent as VendingMachine;
+                if (vm != null)
+                {
+                    vm.shopName = "";
+                    vm.SendNetworkUpdate();
+                    _engine?.NamedContent?.EnqueueDestroy(task.EntityNetId);
+                    return TaskResult.Ok();
+                }
+
+                var bag = ent as SleepingBag;
+                if (bag != null)
+                {
+                    bag.niceName = "";
+                    bag.SendNetworkUpdate();
+                    _engine?.NamedContent?.EnqueueDestroy(task.EntityNetId);
+                    return TaskResult.Ok();
+                }
+
+                return TaskResult.Fail("UNSUPPORTED", ent.ShortPrefabName ?? "entity");
+            }
+            catch (Exception ex)
+            {
+                return TaskResult.Fail("CLEAR_FAILED", ex.Message);
+            }
+        }
+
+        private TaskResult HandleAudioClearTask(JToken raw)
+        {
+            var task = Parse<AudioClearTaskDto>(raw);
+            BaseEntity ent;
+            TaskResult error;
+            if (!TryFindTaskEntity(task?.EntityNetId, out ent, out error)) return error;
+
+            try
+            {
+                if (!ClearCassetteAudio(ent))
+                    return TaskResult.Fail("UNSUPPORTED", ent.ShortPrefabName ?? "entity");
+                _engine?.Audio?.ForgetCrc(task.EntityNetId);
+                return TaskResult.Ok();
+            }
+            catch (Exception ex)
+            {
+                return TaskResult.Fail("CLEAR_FAILED", ex.Message);
+            }
+        }
+
+        private static bool TryFindTaskEntity(string rawNetId, out BaseEntity entity, out TaskResult error)
+        {
+            entity = null;
+            error = null;
+            if (string.IsNullOrEmpty(rawNetId))
+            {
+                error = TaskResult.Fail("NO_TARGET", "entityNetId missing");
+                return false;
+            }
+
+            ulong id;
+            if (!ulong.TryParse(rawNetId, NumberStyles.Integer, CultureInfo.InvariantCulture, out id))
+            {
+                error = TaskResult.Fail("BAD_ENTITY", rawNetId);
+                return false;
+            }
+
+            entity = BaseNetworkable.serverEntities.Find(new NetworkableId(id)) as BaseEntity;
+            if (entity == null || entity.IsDestroyed)
+            {
+                entity = null;
+                error = TaskResult.Fail("ENTITY_GONE", rawNetId);
+                return false;
+            }
+            return true;
+        }
+
+        private static bool ClearCassetteAudio(BaseEntity entity)
+        {
+            if (entity == null || entity.IsDestroyed || !ContentIndex.IsCassette(entity)) return false;
+
+            uint previous = Members.CassetteAudioIdOf(entity);
+            Members.ClearCassetteAudioId(entity);
+            if (previous != 0 && entity.net != null) Members.RemoveAudioBlob(previous, entity.net.ID);
+
+            entity.SendNetworkUpdate();
+            return true;
+        }
+
+        private static void ClearSignageTextures(Signage signage)
+        {
+            if (signage.net == null) return;
+            ZeroAll(signage.textureIDs);
+            ZeroAll(((ISignage)signage).GetTextureCRCs());
+            signage.SendNetworkUpdate();
+        }
+
+        private static void ClearPhotoFrameTextures(PhotoFrame frame)
+        {
+            if (frame.net == null) return;
+            Members.ClearPhotoOverlay(frame);
+            ZeroAll(((ISignage)frame).GetTextureCRCs());
+            frame.SendNetworkUpdate();
+        }
+
+        private static void ClearPumpkinTextures(CarvablePumpkin pumpkin)
+        {
+            if (pumpkin.net == null) return;
+            ZeroAll(Members.PumpkinTextureIds(pumpkin));
+            pumpkin.SendNetworkUpdate();
+        }
+
+        private static void ClearBaseSculpture(BaseSculpture sculpture)
+        {
+            if (sculpture.IsDestroyed) return;
+            if (Members.ResetSculpture(sculpture))
+            {
+                sculpture.SendNetworkUpdate();
+                return;
+            }
+            sculpture.Kill();
+        }
+
+        private static void ClearFireworkDesign(PatternFirework firework)
+        {
+            var stars = firework.Design?.stars;
+            if (stars != null) stars.Clear();
+            firework.SendNetworkUpdate();
+        }
+
+        private static void ZeroAll(uint[] ids)
+        {
+            if (ids == null) return;
+            for (int i = 0; i < ids.Length; i++) ids[i] = 0;
+        }
 
         private TaskResult HandleMuteTask(JToken raw)
         {
@@ -1929,9 +4717,14 @@ namespace Oxide.Plugins
                     return error;
                 destination = anchor.transform.position;
             }
+            else if (task.X.HasValue && task.Y.HasValue && task.Z.HasValue)
+            {
+                destination = new Vector3(task.X.Value, task.Y.Value, task.Z.Value);
+            }
             else
             {
-                destination = new Vector3(task.X, task.Y, task.Z);
+                // no coords used to mean 0,0,0
+                return TaskResult.Fail("NO_DESTINATION", "targetSteamId or x/y/z required");
             }
 
             player.Teleport(destination);
@@ -1971,10 +4764,10 @@ namespace Oxide.Plugins
                 error = TaskResult.Fail("BAD_STEAMID", steamId);
                 return false;
             }
-            player = BasePlayer.FindByID(uid);
-            if (player == null || !player.IsConnected)
+            // FindByID sometimes misses connected players
+            player = FindConnectedPlayer(uid.ToString(CultureInfo.InvariantCulture));
+            if (player == null)
             {
-                player = null;
                 error = TaskResult.Fail("PLAYER_OFFLINE", offlineMessage);
                 return false;
             }
@@ -2065,11 +4858,793 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Addon Runtime
+
+        // Addon logic lives in the backend, the plugin only runs the primitives below.
+        // See PROTOCOL_V2.md "Addon runtime".
+
+        private const int RuntimeVersion = 1;
+        private const string RuntimeFileName = "RCore/runtime";
+        private const int CommandTimeoutSeconds = 5;
+        private const float MinCommandCooldownSeconds = 2f;
+        private const float RuntimeEventsFlushSeconds = 2f;
+        private const int MaxRuntimeEventsBuffered = 1000;
+        private const int MaxRuntimeEventsPerBatch = 200;
+        private const int MaxManifestBytes = 256 * 1024;
+        private const int MaxManifestCommands = 50;
+        private const int MaxManifestTriggers = 200;
+        private const int MaxManifestGroups = 32;
+        private const int MaxActionsPerReply = 10;
+        private const int MaxActionsPerTrigger = 5;
+        private const int MaxRuntimeTextChars = 512;
+        private const int MinScheduleSeconds = 30;
+        private const int MaxScheduleSeconds = 7 * 86400;
+        private const int MaxRuleDelaySeconds = 600;
+        private const int MaxPendingRuleRuns = 2000;
+
+        private static readonly string[] RuntimeActionNames = { "message", "toast", "group.add", "group.remove" };
+        private static readonly string[] RuntimeEventNames = { "player.connected", "player.disconnected", "player.respawned" };
+        private static readonly string[] RuntimeFeatureNames = { "commands", "schedules", "joinRules", "groups", "events" };
+        private static readonly HashSet<string> RichTextTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "color", "size", "b", "i" };
+        private static readonly System.Text.RegularExpressions.Regex RichTextTag =
+            new System.Text.RegularExpressions.Regex(@"</?([a-zA-Z]+)(=[^<>]*)?>", System.Text.RegularExpressions.RegexOptions.Compiled);
+        private static readonly System.Text.RegularExpressions.Regex RuntimeIdentifier =
+            new System.Text.RegularExpressions.Regex(@"^[A-Za-z0-9_.-]{1,64}$", System.Text.RegularExpressions.RegexOptions.Compiled);
+        private static readonly System.Text.RegularExpressions.Regex RuntimeCommandName =
+            new System.Text.RegularExpressions.Regex(@"^[a-z0-9_]{1,32}$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private class RuntimeStore
+        {
+            [JsonProperty("manifestVersion")] public string ManifestVersion;
+            [JsonProperty("manifest")] public JObject Manifest;
+            // group -> steamIds we added ourselves, only these get removed
+            [JsonProperty("managed")] public Dictionary<string, List<string>> Managed = new Dictionary<string, List<string>>();
+        }
+
+        private class RuntimeManifest
+        {
+            [JsonProperty("version")] public int Version;
+            [JsonProperty("commands")] public List<ManifestCommandDto> Commands = new List<ManifestCommandDto>();
+            [JsonProperty("schedules")] public List<ManifestScheduleDto> Schedules = new List<ManifestScheduleDto>();
+            [JsonProperty("rules")] public List<ManifestRuleDto> Rules = new List<ManifestRuleDto>();
+            [JsonProperty("events")] public List<string> Events = new List<string>();
+            [JsonProperty("groups")] public List<string> Groups = new List<string>();
+        }
+
+        private class ManifestCommandDto
+        {
+            [JsonProperty("name")] public string Name;
+            [JsonProperty("addon")] public string Addon;
+            [JsonProperty("cooldownSeconds")] public int CooldownSeconds;
+        }
+
+        private class ManifestScheduleDto
+        {
+            [JsonProperty("id")] public string Id;
+            [JsonProperty("addon")] public string Addon;
+            [JsonProperty("everySeconds")] public int EverySeconds;
+            [JsonProperty("offsetSeconds")] public int OffsetSeconds;
+            [JsonProperty("minOnline")] public int MinOnline;
+            [JsonProperty("actions")] public List<JObject> Actions = new List<JObject>();
+        }
+
+        private class ManifestRuleDto
+        {
+            [JsonProperty("id")] public string Id;
+            [JsonProperty("addon")] public string Addon;
+            [JsonProperty("on")] public string On;
+            [JsonProperty("delaySeconds")] public int DelaySeconds;
+            [JsonProperty("actions")] public List<JObject> Actions = new List<JObject>();
+        }
+
+        private class RuntimeCapabilityDto
+        {
+            [JsonProperty("version")] public int Version = RuntimeVersion;
+            [JsonProperty("manifestVersion")] public string ManifestVersion;
+            [JsonProperty("actions")] public string[] Actions = RuntimeActionNames;
+            [JsonProperty("events")] public string[] Events = RuntimeEventNames;
+            [JsonProperty("features")] public string[] Features = RuntimeFeatureNames;
+            [JsonProperty("conflicts")] public List<string> Conflicts = new List<string>();
+        }
+
+        private class CommandRequestDto
+        {
+            [JsonProperty("command")] public string Command;
+            [JsonProperty("args")] public List<string> Args;
+            [JsonProperty("steamId")] public string SteamId;
+            [JsonProperty("playerName", NullValueHandling = NullValueHandling.Ignore)] public string PlayerName;
+            [JsonProperty("lang", NullValueHandling = NullValueHandling.Ignore)] public string Lang;
+            [JsonProperty("eventId")] public string EventId;
+        }
+
+        private class CommandResponseDto
+        {
+            [JsonProperty("actions")] public List<JObject> Actions;
+        }
+
+        private class RuntimeEventDto
+        {
+            [JsonProperty("eventId")] public string EventId;
+            [JsonProperty("type")] public string Type;
+            [JsonProperty("steamId")] public string SteamId;
+            [JsonProperty("playerName", NullValueHandling = NullValueHandling.Ignore)] public string PlayerName;
+            [JsonProperty("at")] public string At;
+        }
+
+        private class RuntimeEventsBatch
+        {
+            [JsonProperty("events")] public List<RuntimeEventDto> Events;
+        }
+
+        private class RuntimeWorker : RCoreWorker
+        {
+            private sealed class ScheduleState
+            {
+                public ManifestScheduleDto Def;
+                public float NextAt;
+            }
+
+            private sealed class PendingRuleRun
+            {
+                public ManifestRuleDto Rule;
+                public ulong SteamId;
+                public float DueAt;
+            }
+
+            private RuntimeStore _store;
+            private RuntimeManifest _manifest = new RuntimeManifest();
+            private readonly Dictionary<string, ManifestCommandDto> _commands = new Dictionary<string, ManifestCommandDto>(StringComparer.OrdinalIgnoreCase);
+            private readonly HashSet<string> _events = new HashSet<string>(StringComparer.Ordinal);
+            private readonly HashSet<string> _groups = new HashSet<string>(StringComparer.Ordinal);
+            private readonly List<string> _conflicts = new List<string>();
+            private readonly List<ScheduleState> _schedules = new List<ScheduleState>();
+            private readonly List<PendingRuleRun> _pendingRules = new List<PendingRuleRun>();
+            private readonly Dictionary<string, float> _cooldowns = new Dictionary<string, float>(StringComparer.Ordinal);
+            private readonly List<RuntimeEventDto> _eventBuffer = new List<RuntimeEventDto>();
+            private List<RuntimeEventDto> _eventsInFlight;
+            private float _lastEventsFlush;
+            private bool _storeDirty;
+
+            // 1s tick for schedules, delayed join rules and event flush
+            protected override float Interval => 1f;
+
+            public RuntimeCapabilityDto Capability() => new RuntimeCapabilityDto
+            {
+                ManifestVersion = Store.ManifestVersion,
+                Conflicts = new List<string>(_conflicts)
+            };
+
+            private RuntimeStore Store
+            {
+                get
+                {
+                    if (_store != null) return _store;
+                    _store = Instance != null ? Instance.TryLoad<RuntimeStore>(RuntimeFileName, "runtime") : new RuntimeStore();
+                    if (_store.Managed == null) _store.Managed = new Dictionary<string, List<string>>();
+                    if (_store.Manifest != null)
+                    {
+                        RuntimeManifest cached;
+                        string error;
+                        if (TryReadManifest(_store.Manifest, out cached, out error)) Apply(cached);
+                        else
+                        {
+                            WarnThrottled("runtime", $"cached manifest ignored: {error}");
+                            _store.Manifest = null;
+                            _store.ManifestVersion = null;
+                        }
+                    }
+                    return _store;
+                }
+            }
+
+            private void Start()
+            {
+                var unused = Store;
+            }
+
+            protected override void Tick()
+            {
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                RunDueSchedules(now);
+                RunDueRules(now);
+                if (_eventBuffer.Count > 0 && now - _lastEventsFlush >= RuntimeEventsFlushSeconds) FlushEvents(now);
+                if (_storeDirty) SaveStore();
+            }
+
+            protected override void Drain()
+            {
+                UnregisterAllCommands();
+                _schedules.Clear();
+                _pendingRules.Clear();
+                _eventBuffer.Clear();
+                _eventsInFlight = null;
+                if (_storeDirty) SaveStore();
+            }
+
+
+            public void ApplyFromBackend(JObject manifestJson, string version)
+            {
+                if (manifestJson == null || string.IsNullOrEmpty(version)) return;
+                RuntimeManifest parsed;
+                string error;
+                if (!TryReadManifest(manifestJson, out parsed, out error))
+                {
+                    // keep running the cached one
+                    WarnThrottled("runtime", $"manifest {version} rejected: {error}");
+                    return;
+                }
+
+                var store = Store;
+                Apply(parsed);
+                store.Manifest = manifestJson;
+                store.ManifestVersion = version;
+                _storeDirty = true;
+                SaveStore();
+            }
+
+            private static bool TryReadManifest(JObject json, out RuntimeManifest manifest, out string error)
+            {
+                manifest = null;
+                error = null;
+                try
+                {
+                    if (json.ToString(Formatting.None).Length > MaxManifestBytes) { error = "too large"; return false; }
+                    manifest = json.ToObject<RuntimeManifest>();
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                    return false;
+                }
+                if (manifest == null) { error = "empty"; return false; }
+                if (manifest.Version != RuntimeVersion) { error = $"unsupported version {manifest.Version}"; return false; }
+                if (manifest.Commands == null) manifest.Commands = new List<ManifestCommandDto>();
+                if (manifest.Schedules == null) manifest.Schedules = new List<ManifestScheduleDto>();
+                if (manifest.Rules == null) manifest.Rules = new List<ManifestRuleDto>();
+                if (manifest.Events == null) manifest.Events = new List<string>();
+                if (manifest.Groups == null) manifest.Groups = new List<string>();
+
+                if (manifest.Commands.Count > MaxManifestCommands) { error = "too many commands"; return false; }
+                if (manifest.Schedules.Count + manifest.Rules.Count > MaxManifestTriggers) { error = "too many schedules and rules"; return false; }
+                if (manifest.Groups.Count > MaxManifestGroups) { error = "too many groups"; return false; }
+                foreach (var c in manifest.Commands)
+                    if (c == null || string.IsNullOrEmpty(c.Name) || !RuntimeCommandName.IsMatch(c.Name)) { error = "bad command name"; return false; }
+                foreach (var g in manifest.Groups)
+                    if (string.IsNullOrEmpty(g) || !RuntimeIdentifier.IsMatch(g)) { error = "bad group name"; return false; }
+                foreach (var s in manifest.Schedules)
+                    if (s == null || s.EverySeconds < MinScheduleSeconds || s.EverySeconds > MaxScheduleSeconds
+                        || s.OffsetSeconds < 0 || s.Actions == null || s.Actions.Count == 0 || s.Actions.Count > MaxActionsPerTrigger)
+                    { error = "bad schedule"; return false; }
+                foreach (var r in manifest.Rules)
+                    if (r == null || r.On != "player.connected" || r.DelaySeconds < 0 || r.DelaySeconds > MaxRuleDelaySeconds
+                        || r.Actions == null || r.Actions.Count == 0 || r.Actions.Count > MaxActionsPerTrigger)
+                    { error = "bad rule"; return false; }
+                return true;
+            }
+
+            private void Apply(RuntimeManifest next)
+            {
+                // diff so unchanged commands stay registered
+                var wanted = new Dictionary<string, ManifestCommandDto>(StringComparer.OrdinalIgnoreCase);
+                foreach (var c in next.Commands) wanted[c.Name] = c;
+
+                var toRemove = new List<string>();
+                foreach (var name in _commands.Keys) if (!wanted.ContainsKey(name)) toRemove.Add(name);
+                foreach (var name in toRemove) UnregisterCommand(name);
+
+                _conflicts.Clear();
+                foreach (var pair in wanted)
+                {
+                    if (_commands.ContainsKey(pair.Key)) { _commands[pair.Key] = pair.Value; continue; }
+                    if (Instance != null && Instance.IsChatCommandTakenByOther(pair.Key)) { _conflicts.Add(pair.Key); continue; }
+                    if (RegisterCommand(pair.Key)) _commands[pair.Key] = pair.Value;
+                    else _conflicts.Add(pair.Key);
+                }
+
+                // unchanged schedules keep their timing
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                var previous = new Dictionary<string, ScheduleState>(StringComparer.Ordinal);
+                foreach (var s in _schedules) if (s.Def?.Id != null) previous[s.Def.Addon + "/" + s.Def.Id] = s;
+                _schedules.Clear();
+                foreach (var def in next.Schedules)
+                {
+                    ScheduleState keep;
+                    float nextAt = previous.TryGetValue(def.Addon + "/" + def.Id, out keep) && keep.Def.EverySeconds == def.EverySeconds
+                        ? keep.NextAt
+                        : now + Mathf.Max(1, def.OffsetSeconds > 0 ? def.OffsetSeconds : def.EverySeconds);
+                    _schedules.Add(new ScheduleState { Def = def, NextAt = nextAt });
+                }
+
+                _events.Clear();
+                foreach (var e in next.Events) if (Array.IndexOf(RuntimeEventNames, e) >= 0) _events.Add(e);
+
+                // group removed from manifest -> drop memberships we added
+                var nextGroups = new HashSet<string>(next.Groups, StringComparer.Ordinal);
+                foreach (var g in new List<string>(_groups))
+                    if (!nextGroups.Contains(g)) ReleaseGroup(g);
+                _groups.Clear();
+                foreach (var g in nextGroups) _groups.Add(g);
+
+                _pendingRules.RemoveAll(p => !next.Rules.Exists(r => r.Id == p.Rule.Id && r.Addon == p.Rule.Addon));
+                _manifest = next;
+
+                // report conflicts now, not on the next full sync
+                if (_conflicts.Count > 0) Engine?.RequestFullSync(2f);
+            }
+
+            // unlink only, not on reload
+            public void ResetForUnlink()
+            {
+                foreach (var g in new List<string>(Store.Managed.Keys)) ReleaseGroup(g);
+                UnregisterAllCommands();
+                _schedules.Clear();
+                _pendingRules.Clear();
+                _eventBuffer.Clear();
+                _manifest = new RuntimeManifest();
+                _store = new RuntimeStore();
+                _storeDirty = true;
+                SaveStore();
+            }
+
+            private void SaveStore()
+            {
+                if (Instance == null || _store == null) return;
+                if (Instance.TrySave(RuntimeFileName, _store, "runtime")) _storeDirty = false;
+            }
+
+
+            private bool RegisterCommand(string name)
+            {
+                try
+                {
+                    Instance.cmd.AddChatCommand(name, Instance, (Action<BasePlayer, string, string[]>)OnRuntimeCommand);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    WarnThrottled("runtime", $"could not register /{name}: {ex.Message}");
+                    return false;
+                }
+            }
+
+            private void UnregisterCommand(string name)
+            {
+                _commands.Remove(name);
+                try { Instance?.cmd.RemoveChatCommand(name, Instance); }
+                catch (Exception ex) { WarnThrottled("runtime", $"could not unregister /{name}: {ex.Message}"); }
+            }
+
+            private void UnregisterAllCommands()
+            {
+                foreach (var name in new List<string>(_commands.Keys)) UnregisterCommand(name);
+            }
+
+            private void OnRuntimeCommand(BasePlayer player, string command, string[] args)
+            {
+                var plugin = Instance;
+                if (plugin == null || player == null || !player.IsConnected || !plugin.IsLinked) return;
+
+                ManifestCommandDto def;
+                if (!_commands.TryGetValue(command ?? "", out def)) return;
+
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                float cooldown = Mathf.Max(MinCommandCooldownSeconds, def.CooldownSeconds);
+                string key = player.UserIDString + "/" + def.Name;
+                float last;
+                if (_cooldowns.TryGetValue(key, out last) && now - last < cooldown)
+                {
+                    player.ChatMessage(plugin.Message("Runtime.Cooldown", player, Mathf.CeilToInt(cooldown - (now - last))));
+                    return;
+                }
+                _cooldowns[key] = now;
+                if (_cooldowns.Count > 5000) _cooldowns.Clear();
+
+                var argList = new List<string>();
+                if (args != null)
+                    for (int i = 0; i < args.Length && i < 16; i++)
+                        argList.Add(args[i] != null && args[i].Length > 128 ? args[i].Substring(0, 128) : args[i] ?? "");
+
+                var request = new CommandRequestDto
+                {
+                    Command = def.Name,
+                    Args = argList,
+                    SteamId = player.UserIDString,
+                    PlayerName = player.displayName,
+                    Lang = plugin.lang.GetLanguage(player.UserIDString),
+                    EventId = NewEventId()
+                };
+
+                ulong uid = player.userID;
+                // not Send(): it allows one request in flight, commands from many players would get dropped
+                plugin.Request(CommandPath, JsonConvert.SerializeObject(request, Formatting.None), RequestMethod.POST,
+                    (code, body) =>
+                    {
+                        if (this == null || Instance == null) return;
+                        var self = FindConnectedPlayer(uid.ToString(CultureInfo.InvariantCulture));
+                        if (self == null) return;
+
+                        if (code < 200 || code >= 300)
+                        {
+                            self.ChatMessage(Instance.Message("Runtime.Unavailable", self));
+                            return;
+                        }
+
+                        CommandResponseDto parsed = null;
+                        try { parsed = string.IsNullOrEmpty(body) ? null : JsonConvert.DeserializeObject<CommandResponseDto>(body); }
+                        catch (JsonException ex) { WarnThrottled("runtime", $"unreadable command reply: {ex.Message}"); }
+                        if (parsed?.Actions == null) return;
+
+                        for (int i = 0; i < parsed.Actions.Count && i < MaxActionsPerReply; i++)
+                            Execute(parsed.Actions[i], self);
+                    },
+                    timeoutSeconds: CommandTimeoutSeconds);
+            }
+
+
+            private void RunDueSchedules(float now)
+            {
+                for (int i = 0; i < _schedules.Count; i++)
+                {
+                    var s = _schedules[i];
+                    if (now < s.NextAt) continue;
+                    s.NextAt = now + s.Def.EverySeconds;
+                    if (BasePlayer.activePlayerList.Count < s.Def.MinOnline) continue;
+                    foreach (var action in s.Def.Actions) Execute(action, null);
+                }
+            }
+
+            private void RunDueRules(float now)
+            {
+                if (_pendingRules.Count == 0) return;
+                for (int i = _pendingRules.Count - 1; i >= 0; i--)
+                {
+                    var run = _pendingRules[i];
+                    if (now < run.DueAt) continue;
+                    _pendingRules.RemoveAt(i);
+                    var player = FindConnectedPlayer(run.SteamId.ToString(CultureInfo.InvariantCulture));
+                    if (player == null) continue;
+                    foreach (var action in run.Rule.Actions) Execute(action, player);
+                }
+            }
+
+            public void OnPlayerConnected(BasePlayer player)
+            {
+                if (player == null || !IsRealSteamId(player.userID)) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                foreach (var rule in _manifest.Rules)
+                {
+                    if (rule.On != "player.connected") continue;
+                    if (rule.DelaySeconds <= 0) { foreach (var a in rule.Actions) Execute(a, player); continue; }
+                    if (_pendingRules.Count >= MaxPendingRuleRuns) break;
+                    _pendingRules.Add(new PendingRuleRun { Rule = rule, SteamId = player.userID, DueAt = now + rule.DelaySeconds });
+                }
+                RecordEvent("player.connected", player);
+            }
+
+            public void RecordEvent(string type, BasePlayer player)
+            {
+                if (player == null || !_events.Contains(type) || !IsRealSteamId(player.userID)) return;
+                if (_eventBuffer.Count >= MaxRuntimeEventsBuffered) _eventBuffer.RemoveAt(0);
+                _eventBuffer.Add(new RuntimeEventDto
+                {
+                    EventId = NewEventId(),
+                    Type = type,
+                    SteamId = player.UserIDString,
+                    PlayerName = player.displayName,
+                    At = UtcNow()
+                });
+            }
+
+            private void FlushEvents(float now)
+            {
+                if (!Ready || Instance == null || !Instance.IsLinked) return;
+                _lastEventsFlush = now;
+                int take = Math.Min(_eventBuffer.Count, MaxRuntimeEventsPerBatch);
+                _eventsInFlight = _eventBuffer.GetRange(0, take);
+                _eventBuffer.RemoveRange(0, take);
+
+                Send<JObject>(EventsPath, new RuntimeEventsBatch { Events = _eventsInFlight },
+                    _ => { _eventsInFlight = null; },
+                    (code, body) =>
+                    {
+                        // requeue once, buffer cap limits memory on long outages
+                        if (_eventsInFlight != null) _eventBuffer.InsertRange(0, _eventsInFlight);
+                        _eventsInFlight = null;
+                        if (_eventBuffer.Count > MaxRuntimeEventsBuffered)
+                            _eventBuffer.RemoveRange(0, _eventBuffer.Count - MaxRuntimeEventsBuffered);
+                    });
+            }
+
+
+            public void ReconcileGroups(Dictionary<string, List<string>> desired)
+            {
+                var plugin = Instance;
+                if (plugin == null || desired == null) return;
+                var store = Store;
+
+                foreach (var pair in desired)
+                {
+                    string group = pair.Key;
+                    if (!_groups.Contains(group) || pair.Value == null) continue;
+                    EnsureGroup(group);
+
+                    var want = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var id in pair.Value) if (IsRealSteamId(id)) want.Add(id);
+
+                    List<string> managed;
+                    if (!store.Managed.TryGetValue(group, out managed) || managed == null)
+                        store.Managed[group] = managed = new List<string>();
+
+                    foreach (var id in want)
+                    {
+                        if (plugin.permission.UserHasGroup(id, group)) continue;
+                        plugin.permission.AddUserGroup(id, group);
+                        if (!managed.Contains(id)) managed.Add(id);
+                        _storeDirty = true;
+                    }
+
+                    // backend only knows online players, keep offline ones
+                    for (int i = managed.Count - 1; i >= 0; i--)
+                    {
+                        string id = managed[i];
+                        if (want.Contains(id) || FindConnectedPlayer(id) == null) continue;
+                        plugin.permission.RemoveUserGroup(id, group);
+                        managed.RemoveAt(i);
+                        _storeDirty = true;
+                    }
+                }
+            }
+
+            private void EnsureGroup(string group)
+            {
+                var plugin = Instance;
+                if (plugin == null || plugin.permission.GroupExists(group)) return;
+                plugin.permission.CreateGroup(group, group, 0);
+            }
+
+            private void ReleaseGroup(string group)
+            {
+                var plugin = Instance;
+                List<string> managed;
+                if (plugin == null || !Store.Managed.TryGetValue(group, out managed) || managed == null)
+                {
+                    Store.Managed.Remove(group);
+                    return;
+                }
+                foreach (var id in managed)
+                    if (plugin.permission.UserHasGroup(id, group)) plugin.permission.RemoveUserGroup(id, group);
+                Store.Managed.Remove(group);
+                _storeDirty = true;
+            }
+
+
+            public TaskResult Execute(JObject action, BasePlayer self)
+            {
+                var plugin = Instance;
+                if (plugin == null || action == null) return TaskResult.Fail("INVALID_ACTION", "empty");
+                string type = (string)action["type"];
+                try
+                {
+                    switch (type)
+                    {
+                        case "message": return plugin.RuntimeSendText(action, self, toast: false);
+                        case "toast": return plugin.RuntimeSendText(action, self, toast: true);
+                        case "group.add":
+                        case "group.remove":
+                            return ExecuteGroupAction(type == "group.add", (string)action["steamId"], (string)action["group"]);
+                        default:
+                            return TaskResult.Fail("UNKNOWN_ACTION", type ?? "(none)");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return TaskResult.Fail("INVALID_ACTION", ex.Message);
+                }
+            }
+
+            private TaskResult ExecuteGroupAction(bool add, string steamId, string group)
+            {
+                var plugin = Instance;
+                if (!IsRealSteamId(steamId)) return TaskResult.Fail("INVALID_ACTION", "steamId");
+                if (string.IsNullOrEmpty(group) || !_groups.Contains(group))
+                    return TaskResult.Fail("GROUP_NOT_MANAGED", group ?? "(none)");
+
+                List<string> managed;
+                if (!Store.Managed.TryGetValue(group, out managed) || managed == null)
+                    Store.Managed[group] = managed = new List<string>();
+
+                if (add)
+                {
+                    EnsureGroup(group);
+                    if (!plugin.permission.UserHasGroup(steamId, group))
+                    {
+                        plugin.permission.AddUserGroup(steamId, group);
+                        if (!managed.Contains(steamId)) managed.Add(steamId);
+                    }
+                }
+                else if (managed.Remove(steamId))
+                {
+                    // only remove what we added
+                    plugin.permission.RemoveUserGroup(steamId, group);
+                }
+                _storeDirty = true;
+                return TaskResult.Ok();
+            }
+        }
+
+        private TaskResult HandleActionTask(JToken raw)
+        {
+            var runtime = _engine?.Runtime;
+            if (runtime == null) return TaskResult.Fail("RUNTIME_UNAVAILABLE", "runtime not started");
+            return runtime.Execute(raw as JObject, null);
+        }
+
+        // text rendered once per language, not per player
+        private TaskResult RuntimeSendText(JObject action, BasePlayer self, bool toast)
+        {
+            var texts = action["texts"] as JObject;
+            if (texts == null || !texts.HasValues) return TaskResult.Fail("INVALID_ACTION", "texts");
+
+            var targets = ResolveRuntimeTargets(action["targets"], self);
+            if (targets == null) return TaskResult.Fail("INVALID_ACTION", "targets");
+            if (targets.Count == 0) return TaskResult.Ok();
+
+            string defaultLanguage = (string)action["defaultLanguage"];
+            string prefix = null;
+            ulong avatar = _config.AvatarSteamId;
+            int toastStyle = 0;
+            var style = action["style"];
+            if (!toast && style is JObject)
+            {
+                string rawPrefix = (string)style["prefix"];
+                string color = (string)style["prefixColor"];
+                if (!string.IsNullOrEmpty(rawPrefix))
+                {
+                    prefix = SanitizeRichText(rawPrefix);
+                    if (!string.IsNullOrEmpty(color) && color.Length == 7 && color[0] == '#') prefix = $"<color={color}>{prefix}</color>";
+                }
+                ulong customAvatar;
+                if (ulong.TryParse((string)style["avatarSteamId"], NumberStyles.Integer, CultureInfo.InvariantCulture, out customAvatar)
+                    && IsRealSteamId(customAvatar))
+                    avatar = customAvatar;
+            }
+            else if (toast && style != null && style.Type == JTokenType.String && (string)style == "error")
+                toastStyle = 1;
+
+            var byLanguage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var player in targets)
+            {
+                string language = lang.GetLanguage(player.UserIDString) ?? "en";
+                string template;
+                if (!byLanguage.TryGetValue(language, out template))
+                {
+                    template = PickRuntimeText(texts, language, defaultLanguage);
+                    template = template == null ? null : SanitizeRichText(RenderServerPlaceholders(template));
+                    byLanguage[language] = template;
+                }
+                if (string.IsNullOrEmpty(template)) continue;
+
+                string text = template.IndexOf("{player.", StringComparison.Ordinal) >= 0
+                    ? template.Replace("{player.name}", SafePlayerName(player.displayName))
+                              .Replace("{player.steamId}", player.UserIDString)
+                    : template;
+
+                if (toast) player.SendConsoleCommand("gametip.showtoast", toastStyle, text, "");
+                else player.SendConsoleCommand("chat.add", 0, avatar, prefix == null ? text : $"{prefix} {text}");
+            }
+            return TaskResult.Ok();
+        }
+
+        private List<BasePlayer> ResolveRuntimeTargets(JToken targets, BasePlayer self)
+        {
+            var result = new List<BasePlayer>();
+            if (targets == null) return null;
+
+            if (targets.Type == JTokenType.Array)
+            {
+                foreach (var id in targets)
+                {
+                    var p = FindConnectedPlayer((string)id);
+                    if (p != null) result.Add(p);
+                }
+                return result;
+            }
+            if (targets.Type != JTokenType.String) return null;
+
+            string spec = (string)targets;
+            if (spec == "self")
+            {
+                if (self != null && self.IsConnected) result.Add(self);
+                return result;
+            }
+
+            string group = spec.StartsWith("group:", StringComparison.Ordinal) ? spec.Substring(6) : null;
+            string perm = spec.StartsWith("perm:", StringComparison.Ordinal) ? spec.Substring(5) : null;
+            if (spec != "all" && group == null && perm == null) return null;
+
+            for (int i = 0; i < BasePlayer.activePlayerList.Count; i++)
+            {
+                var p = BasePlayer.activePlayerList[i];
+                if (p == null || !p.IsConnected) continue;
+                if (group != null && !permission.UserHasGroup(p.UserIDString, group)) continue;
+                if (perm != null && !permission.UserHasPermission(p.UserIDString, perm)) continue;
+                result.Add(p);
+            }
+            return result;
+        }
+
+        private static string PickRuntimeText(JObject texts, string language, string defaultLanguage)
+        {
+            string text = (string)texts[language];
+            if (text == null && language.Length > 2) text = (string)texts[language.Substring(0, 2)];
+            if (text == null && !string.IsNullOrEmpty(defaultLanguage)) text = (string)texts[defaultLanguage];
+            if (text == null) text = (string)texts["en"];
+            if (text == null)
+            {
+                foreach (var pair in texts) { text = (string)pair.Value; break; }
+            }
+            if (text != null && text.Length > MaxRuntimeTextChars) text = text.Substring(0, MaxRuntimeTextChars);
+            return text;
+        }
+
+        private static string RenderServerPlaceholders(string template)
+        {
+            if (template.IndexOf("{server.", StringComparison.Ordinal) < 0) return template;
+            var queue = ServerMgr.Instance?.connectionQueue;
+            return template
+                .Replace("{server.name}", SafePlayerName(ConVar.Server.hostname))
+                .Replace("{server.online}", BasePlayer.activePlayerList.Count.ToString(CultureInfo.InvariantCulture))
+                .Replace("{server.max}", ConVar.Server.maxplayers.ToString(CultureInfo.InvariantCulture))
+                .Replace("{server.queue}", (queue?.queue?.Count ?? 0).ToString(CultureInfo.InvariantCulture));
+        }
+
+        // allow color/size/b/i only
+        private static string SanitizeRichText(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.IndexOf('<') < 0) return text;
+            return RichTextTag.Replace(text, m => RichTextTags.Contains(m.Groups[1].Value) ? m.Value : "");
+        }
+
+        // player names can contain rich text tags
+        private static string SafePlayerName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            return name.Replace("<", "").Replace(">", "");
+        }
+
+        // Oxide keeps chat commands in a private dict. If we can't read it (Carbon) assume free,
+        // Oxide logs a warning on replace anyway.
+        private bool IsChatCommandTakenByOther(string name)
+        {
+            try
+            {
+                var library = cmd;
+                if (library == null) return false;
+                var field = library.GetType().GetField("chatCommands", BindingFlags.Instance | BindingFlags.NonPublic);
+                var dict = field?.GetValue(library) as IDictionary;
+                if (dict == null || !dict.Contains(name)) return false;
+                var entry = dict[name];
+                if (entry == null) return false;
+                var ownerMember = entry.GetType().GetField("Plugin") as MemberInfo ?? entry.GetType().GetProperty("Plugin");
+                object owner = ownerMember is FieldInfo
+                    ? ((FieldInfo)ownerMember).GetValue(entry)
+                    : (ownerMember as PropertyInfo)?.GetValue(entry, null);
+                return owner != null && !ReferenceEquals(owner, this);
+            }
+            catch (Exception ex)
+            {
+                WarnThrottled("runtime", $"command conflict probe unavailable: {ex.Message}");
+                return false;
+            }
+        }
+
+        #endregion
+
         #region Api
 
         private void Request(string path, string body, RequestMethod method,
                              Action<int, string> onComplete, bool authenticated = true,
-                             bool isAutokick = false)
+                             bool isAutokick = false, int timeoutSeconds = 0)
         {
             var pump = _engine?.Http;
             if (pump == null)
@@ -2092,7 +5667,8 @@ namespace Oxide.Plugins
                 BuildHeaders(authenticated),
                 body,
                 onComplete,
-                lane);
+                lane,
+                timeoutSeconds: timeoutSeconds);
         }
 
         private static HttpLane InferHttpLane(string path)
@@ -2105,6 +5681,7 @@ namespace Oxide.Plugins
                 case QueuePath:
                 case AckPath:
                 case WipePath:
+                case CommandPath:
                     return HttpLane.Control;
                 default:
                     return HttpLane.Bulk;
@@ -2152,8 +5729,10 @@ namespace Oxide.Plugins
                 public string Method;
                 public Dictionary<string, string> Headers;
                 public string Body;
+                public byte[] BinaryBody;
                 public Action<int, string> OnComplete;
                 public HttpLane Lane;
+                public int TimeoutSeconds;
             }
 
             private readonly Queue<HttpJob> _authQueue = new Queue<HttpJob>();
@@ -2165,7 +5744,8 @@ namespace Oxide.Plugins
             private bool _destroyed;
 
             public void Enqueue(string url, string method, Dictionary<string, string> headers,
-                                string body, Action<int, string> onComplete, HttpLane lane)
+                                string body, Action<int, string> onComplete, HttpLane lane,
+                                byte[] binaryBody = null, int timeoutSeconds = 0)
             {
                 if (_destroyed)
                 {
@@ -2187,8 +5767,10 @@ namespace Oxide.Plugins
                     Method = method,
                     Headers = headers,
                     Body = body,
+                    BinaryBody = binaryBody,
                     OnComplete = onComplete,
-                    Lane = lane
+                    Lane = lane,
+                    TimeoutSeconds = timeoutSeconds
                 });
                 Pump();
             }
@@ -2242,14 +5824,21 @@ namespace Oxide.Plugins
 
                 try
                 {
+                    int timeout = job.TimeoutSeconds > 0
+                        ? job.TimeoutSeconds
+                        : Mathf.Max(1, (int)RequestTimeoutSeconds);
                     request = new UnityWebRequest(job.Url, job.Method)
                     {
                         downloadHandler = new DownloadHandlerBuffer(),
-                        timeout = Mathf.Max(1, (int)RequestTimeoutSeconds),
+                        timeout = timeout,
                         redirectLimit = 0 // no redirects, keep api key on same host
                     };
 
-                    if (!string.IsNullOrEmpty(job.Body))
+                    if (job.BinaryBody != null && job.BinaryBody.Length > 0)
+                    {
+                        request.uploadHandler = new UploadHandlerRaw(job.BinaryBody);
+                    }
+                    else if (!string.IsNullOrEmpty(job.Body))
                     {
                         byte[] raw = Encoding.UTF8.GetBytes(job.Body);
                         request.uploadHandler = new UploadHandlerRaw(raw);
@@ -2264,8 +5853,10 @@ namespace Oxide.Plugins
                         }
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    WarnThrottled("http", $"could not build request for {job.Url}: {ex.Message}");
+                    request?.Dispose();
                     Finish(job, 0, null);
                     yield break;
                 }
@@ -2286,8 +5877,9 @@ namespace Oxide.Plugins
                         text = request.downloadHandler != null ? request.downloadHandler.text : null;
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    WarnThrottled("http", $"could not read response from {job.Url}: {ex.Message}");
                     code = 0;
                     text = null;
                 }
@@ -2342,7 +5934,7 @@ namespace Oxide.Plugins
                 Level = ConVar.Server.level,
                 Seed = (uint)ConVar.Server.seed,
                 WorldSize = (uint)ConVar.Server.worldsize,
-                SaveCreatedTime = SaveRestore.SaveCreatedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
+                SaveCreatedTime = SaveCreatedTimeOrNull()
             };
 
             Request(WipePath, JsonConvert.SerializeObject(payload, Formatting.None), RequestMethod.POST,
@@ -2609,8 +6201,15 @@ namespace Oxide.Plugins
         {
             result = null;
             if (code != 200 || string.IsNullOrEmpty(response)) return false;
-            try { result = JsonConvert.DeserializeObject<AutokickBatchResponse>(response); }
-            catch { return false; }
+            try
+            {
+                result = JsonConvert.DeserializeObject<AutokickBatchResponse>(response);
+            }
+            catch (JsonException ex)
+            {
+                WarnThrottled("autokick", $"unreadable policy response: {ex.Message}");
+                return false;
+            }
             return result != null && result.Decisions != null;
         }
 
@@ -2861,13 +6460,14 @@ namespace Oxide.Plugins
                 MemoryUsedMb = (long)Performance.current.memoryUsageSystem,
                 QueuedCount = queue?.queue?.Count ?? 0,
                 JoiningCount = queue?.joining?.Count ?? 0,
-                SaveCreatedTime = SaveRestore.SaveCreatedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                SaveCreatedTime = SaveCreatedTimeOrNull(),
                 PluginVersion = Version.ToString(),
                 ProtocolVersion = ProtocolVersion,
                 Framework = Framework,
                 RustProtocol = Rust.Protocol.printable,
                 HeaderImage = ConVar.Server.headerimage,
-                LogoImage = ConVar.Server.logoimage
+                LogoImage = ConVar.Server.logoimage,
+                LevelUrl = string.IsNullOrWhiteSpace(ConVar.Server.levelurl) ? null : ConVar.Server.levelurl.Trim()
             };
         }
 
@@ -3147,6 +6747,7 @@ namespace Oxide.Plugins
             [JsonProperty("disconnects", NullValueHandling = NullValueHandling.Ignore)] public List<DisconnectDto> Disconnects { get; set; }
             [JsonProperty("teams", NullValueHandling = NullValueHandling.Ignore)] public List<TeamDto> Teams { get; set; }
             [JsonProperty("teamChanges", NullValueHandling = NullValueHandling.Ignore)] public List<TeamChangeDto> TeamChanges { get; set; }
+            [JsonProperty("runtime", NullValueHandling = NullValueHandling.Ignore)] public RuntimeCapabilityDto Runtime { get; set; }
         }
 
         private class DisconnectDto
@@ -3177,6 +6778,10 @@ namespace Oxide.Plugins
             [JsonProperty("ok")] public bool Ok { get; set; }
             [JsonProperty("tasks")] public List<QueueTaskDto> Tasks { get; set; }
             [JsonProperty("mutes")] public List<MuteSyncDto> Mutes { get; set; }
+            [JsonProperty("mapNeeded")] public bool MapNeeded { get; set; }
+            [JsonProperty("manifest")] public JObject Manifest { get; set; }
+            [JsonProperty("manifestVersion")] public string ManifestVersion { get; set; }
+            [JsonProperty("groups")] public Dictionary<string, List<string>> Groups { get; set; }
         }
 
         private class MuteSyncDto
@@ -3184,6 +6789,24 @@ namespace Oxide.Plugins
             [JsonProperty("steamId")] public string SteamId { get; set; }
             [JsonProperty("reason")] public string Reason { get; set; }
             [JsonProperty("expiresAt")] public string ExpiresAt { get; set; }
+        }
+
+        private class DrawingClearTaskDto
+        {
+            [JsonProperty("entityNetId")] public string EntityNetId { get; set; }
+            [JsonProperty("drawingId")] public string DrawingId { get; set; }
+        }
+
+        private class NamedContentClearTaskDto
+        {
+            [JsonProperty("entityNetId")] public string EntityNetId { get; set; }
+            [JsonProperty("namedContentId")] public string NamedContentId { get; set; }
+        }
+
+        private class AudioClearTaskDto
+        {
+            [JsonProperty("entityNetId")] public string EntityNetId { get; set; }
+            [JsonProperty("audioId")] public string AudioId { get; set; }
         }
 
         private class ServerInfoDto
@@ -3206,6 +6829,7 @@ namespace Oxide.Plugins
             [JsonProperty("rustProtocol")] public string RustProtocol { get; set; }
             [JsonProperty("headerImage")] public string HeaderImage { get; set; }
             [JsonProperty("logoImage")] public string LogoImage { get; set; }
+            [JsonProperty("levelUrl", NullValueHandling = NullValueHandling.Ignore)] public string LevelUrl { get; set; }
         }
 
         private class PlayerDto
@@ -3269,7 +6893,32 @@ namespace Oxide.Plugins
             [JsonProperty("isHeadshot")] public bool IsHeadshot { get; set; }
             [JsonProperty("bodyPart")] public string BodyPart { get; set; }
 
+            [JsonProperty("combatLog", NullValueHandling = NullValueHandling.Ignore)]
+            public List<CombatLogEventDto> CombatLog { get; set; }
+
             [JsonProperty("raw", NullValueHandling = NullValueHandling.Ignore)] public JToken Raw { get; set; }
+        }
+
+        private class CombatLogEventDto
+        {
+            [JsonProperty("time")] public float Time { get; set; }
+            [JsonProperty("attackerSteamId", NullValueHandling = NullValueHandling.Ignore)] public string AttackerSteamId { get; set; }
+            [JsonProperty("targetSteamId", NullValueHandling = NullValueHandling.Ignore)] public string TargetSteamId { get; set; }
+            [JsonProperty("attacker")] public string Attacker { get; set; }
+            [JsonProperty("target")] public string Target { get; set; }
+            [JsonProperty("weapon")] public string Weapon { get; set; }
+            [JsonProperty("ammo")] public string Ammo { get; set; }
+            [JsonProperty("bone")] public string Bone { get; set; }
+            [JsonProperty("distance")] public float Distance { get; set; }
+            [JsonProperty("hpOld")] public float HpOld { get; set; }
+            [JsonProperty("hpNew")] public float HpNew { get; set; }
+            [JsonProperty("info")] public string Info { get; set; }
+            [JsonProperty("projHits")] public int ProjHits { get; set; }
+            [JsonProperty("projIntegrity")] public float ProjIntegrity { get; set; }
+            [JsonProperty("projTravel")] public float ProjTravel { get; set; }
+            [JsonProperty("projMismatch")] public float ProjMismatch { get; set; }
+            [JsonProperty("desync")] public int Desync { get; set; }
+            [JsonProperty("attackerDead")] public bool AttackerDead { get; set; }
         }
 
         private class Vec3Dto
@@ -3410,9 +7059,9 @@ namespace Oxide.Plugins
         {
             [JsonProperty("steamId")] public string SteamId { get; set; }
             [JsonProperty("targetSteamId")] public string TargetSteamId { get; set; }
-            [JsonProperty("x")] public float X { get; set; }
-            [JsonProperty("y")] public float Y { get; set; }
-            [JsonProperty("z")] public float Z { get; set; }
+            [JsonProperty("x")] public float? X { get; set; }
+            [JsonProperty("y")] public float? Y { get; set; }
+            [JsonProperty("z")] public float? Z { get; set; }
         }
 
         private class GiveTaskDto
@@ -3527,6 +7176,19 @@ namespace Oxide.Plugins
 
         private static string UtcNow() => DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
 
+        internal static string SaveCreatedTimeKey()
+        {
+            DateTime t = SaveRestore.SaveCreatedTime.ToUniversalTime();
+            if (t.Year <= 2000) return "";
+            return t.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        }
+
+        private static string SaveCreatedTimeOrNull()
+        {
+            string key = SaveCreatedTimeKey();
+            return key.Length == 0 ? null : key;
+        }
+
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         private static void Announce(string message) => Instance?.Puts(message);
@@ -3552,8 +7214,26 @@ namespace Oxide.Plugins
         private static T Parse<T>(JToken raw) where T : class
         {
             if (raw == null) return null;
-            try { return raw.ToObject<T>(); }
-            catch { return null; }
+            try
+            {
+                return raw.ToObject<T>();
+            }
+            catch (JsonException ex)
+            {
+                WarnThrottled("tasks", $"unreadable {typeof(T).Name}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static readonly Dictionary<string, float> WarnedAt = new Dictionary<string, float>();
+
+        private static void WarnThrottled(string key, string message)
+        {
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            float last;
+            if (WarnedAt.TryGetValue(key, out last) && now - last < WarnInterval) return;
+            WarnedAt[key] = now;
+            Instance?.PrintWarning($"[{key}] {message}");
         }
 
         private static string CleanIp(string ip)
@@ -3600,6 +7280,87 @@ namespace Oxide.Plugins
                 default:
                     return false;
             }
+        }
+
+        private static string ResolveCombatSteamId(ulong netId, Dictionary<ulong, string> idCache)
+        {
+            string cached;
+            if (idCache.TryGetValue(netId, out cached)) return cached;
+            var entity = BaseNetworkable.serverEntities.Find(new NetworkableId(netId)) as BasePlayer;
+            string sid = entity != null && IsRealSteamId(entity.userID) ? entity.UserIDString : "";
+            idCache[netId] = sid;
+            return sid;
+        }
+
+        private static string NormalizeCombatWeapon(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName) || fullName == "N/A") return fullName ?? "";
+            const string suffix = ".entity.prefab";
+            if (!fullName.EndsWith(suffix, StringComparison.Ordinal)) return fullName;
+            int lastSlash = fullName.LastIndexOf('/');
+            int start = lastSlash + 1;
+            int len = fullName.Length - start - suffix.Length;
+            return len > 0 ? fullName.Substring(start, len) : fullName;
+        }
+
+        private static CombatLogEventDto ToCombatLogDto(float killTime, CombatLog.Event ev, Dictionary<ulong, string> idCache)
+        {
+            string attackerSid = null;
+            string targetSid = null;
+            if (ev.attacker == "player" || ev.attacker == "you")
+                attackerSid = ResolveCombatSteamId(ev.attacker_id, idCache);
+            if (ev.target == "player" || ev.target == "you")
+                targetSid = ResolveCombatSteamId(ev.target_id, idCache);
+
+            return new CombatLogEventDto
+            {
+                Time = killTime - ev.time,
+                AttackerSteamId = string.IsNullOrEmpty(attackerSid) ? null : attackerSid,
+                TargetSteamId = string.IsNullOrEmpty(targetSid) ? null : targetSid,
+                Attacker = ev.attacker,
+                Target = ev.target,
+                Weapon = NormalizeCombatWeapon(ev.weapon),
+                Ammo = ev.ammo ?? "",
+                Bone = ev.bone ?? "",
+                Distance = (float)Math.Round(ev.distance, 2),
+                HpOld = (float)Math.Round(ev.health_old, 2),
+                HpNew = (float)Math.Round(ev.health_new, 2),
+                Info = ev.info ?? "",
+                ProjHits = ev.proj_hits,
+                ProjIntegrity = ev.proj_integrity,
+                ProjTravel = ev.proj_travel,
+                ProjMismatch = ev.proj_mismatch,
+                Desync = ev.desync,
+                AttackerDead = ev.attacker_dead
+            };
+        }
+
+        private static List<CombatLogEventDto> ReadVictimCombatLog(ulong victimUserId)
+        {
+            var all = CombatLog.Get(victimUserId);
+            if (all == null || all.Count == 0) return null;
+
+            var logsList = new List<CombatLog.Event>(all);
+            int last = logsList.Count - 1;
+            var killLog = logsList[last];
+            var idCache = new Dictionary<ulong, string>();
+            var container = new List<CombatLogEventDto>(Math.Min(logsList.Count, MaxCombatLogEntries));
+            container.Add(ToCombatLogDto(killLog.time, killLog, idCache));
+
+            for (int i = last - 1; i >= 0 && container.Count < MaxCombatLogEntries; i--)
+            {
+                var ev = logsList[i];
+                if (ev.target != "player" && ev.target != "you") continue;
+                if (ev.info == "killed") break;
+
+                float gap = Math.Abs(ev.time - logsList[i + 1].time);
+                if (gap > CombatLogGapSeconds) break;
+                if (killLog.time - ev.time > CombatLogDepthSeconds) break;
+
+                container.Add(ToCombatLogDto(killLog.time, ev, idCache));
+            }
+
+            return container.Count == 0 ? null : container;
         }
 
         private DeathEventDto BuildDeathEvent(BasePlayer victim, HitInfo info, bool hasWound, HitRecord wound)
@@ -3706,7 +7467,8 @@ namespace Oxide.Plugins
         private static bool TryGetChatBody(string text, out string body)
         {
             body = "";
-            if (string.IsNullOrWhiteSpace(text)) return false;
+            // Runs for every client console command; every say command starts with "chat.".
+            if (text == null || text.Length < 8 || (text[0] != 'c' && text[0] != 'C')) return false;
 
             string matched = null;
             for (int i = 0; i < ChatSayCommands.Length; i++)
@@ -3808,12 +7570,12 @@ namespace Oxide.Plugins
             player.ChatMessage(notice);
         }
 
-        private void ClearMute(string steamId, bool silent)
+        private void ClearMute(string steamId, bool silent, bool save = true)
         {
             if (_mutes?.ActiveMutes == null) return;
 
             bool removed = _mutes.ActiveMutes.Remove(steamId);
-            if (removed) SaveMutes();
+            if (removed && save) SaveMutes();
 
             var player = FindConnectedPlayer(steamId);
             if (player == null) return;
@@ -3838,7 +7600,8 @@ namespace Oxide.Plugins
                     expired.Add(entry.Key);
             }
 
-            foreach (var steamId in expired) ClearMute(steamId, true);
+            foreach (var steamId in expired) ClearMute(steamId, true, save: false);
+            if (expired.Count > 0) SaveMutes();
             return expired.Count;
         }
 
@@ -3929,7 +7692,7 @@ namespace Oxide.Plugins
                 return _cachedDisplayIp;
             }
 
-            try
+            if (Steamworks.SteamServer.IsValid)
             {
                 var steamIp = Steamworks.SteamServer.PublicIp;
                 if (steamIp != null)
@@ -3941,10 +7704,6 @@ namespace Oxide.Plugins
                         return _cachedDisplayIp;
                     }
                 }
-            }
-            catch
-            {
-                // Steam may not be ready yet
             }
 
             BeginPublicIpLookup();
